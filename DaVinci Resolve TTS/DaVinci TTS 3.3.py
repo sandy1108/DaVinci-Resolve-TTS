@@ -1,6 +1,6 @@
 # ================= 用户配置 =================
 SCRIPT_NAME = "DaVinci TTS"
-SCRIPT_VERSION = " 3.4"
+SCRIPT_VERSION = " 3.4-WSGH"
 SCRIPT_AUTHOR = "HEIBA"
 
 SCREEN_WIDTH = 1920
@@ -70,6 +70,8 @@ AZURE_NAME_TYPE_MAP = {
 }
 
 MINIMAX_MODELS = [
+    "speech-2.6-hd",
+    "speech-2.6-turbo",
     "speech-2.5-hd-preview",
     "speech-2.5-turbo-preview",
     "speech-02-hd",
@@ -1683,7 +1685,7 @@ def on_minimax_model_combo_changed(event):
         items["minimaxEmotionCombo"].Enabled = False  
     else:
         items["minimaxEmotionCombo"].Enabled = True  
-    if selected_model in ["speech-02-hd","speech-02-turbo","speech-01-hd","speech-01-turbo",]:
+    if selected_model in ["speech-2.6-hd","speech-2.6-turbo","speech-02-hd","speech-02-turbo","speech-01-hd","speech-01-turbo",]:
         items["minimaxSubtitleCheckBox"].Enabled = True
     else:
         items["minimaxSubtitleCheckBox"].Checked = False
