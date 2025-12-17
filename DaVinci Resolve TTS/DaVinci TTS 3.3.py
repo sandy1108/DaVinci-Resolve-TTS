@@ -834,10 +834,162 @@ def add_to_media_pool_and_timeline(start_frame, end_frame, filename):
     else:
         print("Failed to append clip to timeline.")
 
-def import_srt_to_timeline(srt_path):
+def adjust_srt_timestamps(srt_path, offset_frames, frame_rate, output_path=None):
     """
-    将指定 .srt 文件导入并追加到当前时间线。
-    返回 True 表示成功，False 表示失败。
+    调整 SRT 文件中的所有时间戳，加上偏移量
+    
+    Args:
+        srt_path: 原始 SRT 文件路径
+        offset_frames: 偏移帧数（音频插入位置）
+        frame_rate: 时间线帧率
+        output_path: 输出文件路径（如果为 None，覆盖原文件）
+    
+    Returns:
+        调整后的 SRT 文件路径
+    """
+    import re
+    
+    # 读取 SRT 文件
+    with open(srt_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # 计算偏移量（秒）
+    offset_seconds = offset_frames / frame_rate
+    
+    # SRT 时间戳格式：00:00:01,000 --> 00:00:03,000
+    def adjust_timestamp(match):
+        """调整单个时间戳"""
+        time_str = match.group(0)
+        
+        # 解析时间：HH:MM:SS,mmm
+        time_match = re.match(r'(\d{2}):(\d{2}):(\d{2}),(\d{3})', time_str)
+        if not time_match:
+            return time_str
+        
+        hours, minutes, seconds, milliseconds = time_match.groups()
+        
+        # 转换为总秒数
+        total_seconds = (
+            int(hours) * 3600 + 
+            int(minutes) * 60 + 
+            int(seconds) + 
+            int(milliseconds) / 1000.0
+        )
+        
+        # 加上偏移量
+        new_total_seconds = total_seconds + offset_seconds
+        
+        # 转换回时间格式
+        new_hours = int(new_total_seconds // 3600)
+        new_minutes = int((new_total_seconds % 3600) // 60)
+        new_seconds = int(new_total_seconds % 60)
+        new_milliseconds = int((new_total_seconds % 1) * 1000)
+        
+        return f"{new_hours:02d}:{new_minutes:02d}:{new_seconds:02d},{new_milliseconds:03d}"
+    
+    # 替换所有时间戳
+    adjusted_content = re.sub(
+        r'\d{2}:\d{2}:\d{2},\d{3}',
+        adjust_timestamp,
+        content
+    )
+    
+    # 保存调整后的文件
+    if output_path is None:
+        output_path = srt_path
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(adjusted_content)
+    
+    print(f"字幕时间已调整，偏移量：{offset_seconds:.2f} 秒 ({offset_frames} 帧)")
+    
+    return output_path
+
+
+def parse_srt_time_range(srt_path, frame_rate):
+    """
+    解析 SRT 文件，返回时间范围（帧数）
+    
+    Args:
+        srt_path: SRT 文件路径
+        frame_rate: 时间线帧率
+    
+    Returns:
+        (start_frame, end_frame) - 字幕的起始和结束帧
+    """
+    import re
+    
+    with open(srt_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # 提取所有时间戳
+    timestamps = re.findall(r'(\d{2}):(\d{2}):(\d{2}),(\d{3})', content)
+    
+    if not timestamps:
+        return None, None
+    
+    def timestamp_to_frames(h, m, s, ms):
+        """将时间戳转换为帧数"""
+        total_seconds = int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+        return int(total_seconds * frame_rate)
+    
+    # 第一个时间戳（开始时间）
+    start_frame = timestamp_to_frames(*timestamps[0])
+    
+    # 最后一个时间戳（结束时间）
+    end_frame = timestamp_to_frames(*timestamps[-1])
+    
+    return start_frame, end_frame
+
+
+def delete_overlapping_subtitles(timeline, start_frame, end_frame):
+    """
+    删除与指定时间范围重叠的字幕片段
+    
+    Args:
+        timeline: 时间线对象
+        start_frame: 开始帧
+        end_frame: 结束帧
+    """
+    sub_count = timeline.GetTrackCount("subtitle")
+    total_deleted = 0
+    
+    for track_index in range(1, sub_count + 1):
+        items = timeline.GetItemListInTrack("subtitle", track_index)
+        
+        if items:
+            overlapping_items = []
+            
+            for item in items:
+                item_start = item.GetStart()
+                item_end = item.GetEnd()
+                
+                # 检查是否重叠
+                # 重叠条件：NOT (item_end < start_frame OR item_start > end_frame)
+                if not (item_end < start_frame or item_start > end_frame):
+                    overlapping_items.append(item)
+                    print(f"  发现重叠字幕：轨道 {track_index}, 范围 {item_start}-{item_end}")
+            
+            # 删除重叠的片段
+            if overlapping_items:
+                timeline.DeleteClips(overlapping_items)
+                total_deleted += len(overlapping_items)
+    
+    if total_deleted > 0:
+        print(f"已删除 {total_deleted} 个重叠的字幕片段")
+    else:
+        print("没有发现重叠的字幕片段")
+
+def import_srt_to_timeline(srt_path, insert_position_frame=0):
+    """
+    将字幕导入到时间线，支持时间偏移和增量替换
+    
+    Args:
+        srt_path: SRT 文件路径
+        insert_position_frame: 音频插入位置（帧数），默认为0
+    
+    Returns:
+        True 表示成功，False 表示失败
     """
     # 1. 获取 Resolve、ProjectManager、Project、Timeline
     project_manager = resolve.GetProjectManager()
@@ -850,40 +1002,67 @@ def import_srt_to_timeline(srt_path):
     if timeline is None:
         print("错误：未找到当前时间线")
         return False
-
-    # 2. 删除所有“subtitle”轨道中的片段
-    sub_count = timeline.GetTrackCount("subtitle")
-    for ti in range(1, sub_count + 1):
-        items = timeline.GetItemListInTrack("subtitle", ti)
-        if items:
-            timeline.DeleteClips(items)  
-
-    # 3. 导入 .srt 到媒体池
+    
+    frame_rate = float(timeline.GetSetting("timelineFrameRate"))
+    
+    # 2. 调整 SRT 时间戳（加上偏移量）
+    if insert_position_frame > 0:
+        # 创建临时文件路径
+        adjusted_srt_path = srt_path.replace('.srt', '_adjusted.srt')
+        
+        # 调整时间戳
+        adjust_srt_timestamps(
+            srt_path=srt_path,
+            offset_frames=insert_position_frame,
+            frame_rate=frame_rate,
+            output_path=adjusted_srt_path
+        )
+        
+        # 使用调整后的文件
+        srt_path_to_import = adjusted_srt_path
+    else:
+        # 不需要偏移，直接使用原文件
+        srt_path_to_import = srt_path
+    
+    # 3. 解析调整后的时间范围
+    start_frame, end_frame = parse_srt_time_range(srt_path_to_import, frame_rate)
+    
+    if start_frame is None:
+        print("无法解析 SRT 时间范围")
+        return False
+    
+    print(f"字幕时间范围：{start_frame} - {end_frame} 帧")
+    
+    # 4. 删除重叠的旧字幕（增量替换）
+    delete_overlapping_subtitles(timeline, start_frame, end_frame)
+    
+    # 5. 导入字幕到媒体池
     media_pool = current_project.GetMediaPool()
     root_folder = media_pool.GetRootFolder()
     media_pool.SetCurrentFolder(root_folder)
 
-    # 可选：删除媒体池中同名旧条目，避免重复
-    file_name = os.path.basename(srt_path)
+    # 删除媒体池中同名旧条目，避免重复
+    file_name = os.path.basename(srt_path_to_import)
     for clip in root_folder.GetClipList():
         if clip.GetName() == file_name:
             media_pool.DeleteClips([clip])
             break
 
-    imported = media_pool.ImportMedia([srt_path])  
+    imported = media_pool.ImportMedia([srt_path_to_import])
     if not imported:
-        print(f"错误：字幕文件导入失败 -> {srt_path}")
+        print(f"错误：字幕文件导入失败 -> {srt_path_to_import}")
         return False
 
-    # 4. 将导入的字幕追加到时间线
+    # 6. 将导入的字幕追加到时间线
     new_clip = imported[0]
-    success = media_pool.AppendToTimeline([new_clip])  
+    success = media_pool.AppendToTimeline([new_clip])
     if not success:
         print("错误：将字幕添加到时间线失败")
         return False
 
     print(f"字幕已成功加载到时间线: {file_name}")
     return True
+
 
 msgbox = dispatcher.AddWindow(
         {
