@@ -1,6 +1,6 @@
 # ================= 用户配置 =================
 SCRIPT_NAME = "DaVinci TTS"
-SCRIPT_VERSION = " 3.4-WSGH"
+SCRIPT_VERSION = " 3.5-WSGH"
 SCRIPT_AUTHOR = "HEIBA"
 
 SCREEN_WIDTH = 1920
@@ -70,7 +70,9 @@ AZURE_NAME_TYPE_MAP = {
 }
 
 MINIMAX_MODELS = [
+    "speech-2.8-hd",
     "speech-2.6-hd",
+    "speech-2.8-turbo",
     "speech-2.6-turbo",
     "speech-2.5-hd-preview",
     "speech-2.5-turbo-preview",
