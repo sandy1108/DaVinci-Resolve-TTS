@@ -1866,7 +1866,7 @@ def on_minimax_model_combo_changed(event):
         items["minimaxEmotionCombo"].Enabled = False  
     else:
         items["minimaxEmotionCombo"].Enabled = True  
-    if selected_model in ["speech-2.6-hd","speech-2.6-turbo","speech-02-hd","speech-02-turbo","speech-01-hd","speech-01-turbo",]:
+    if selected_model in ["speech-2.8-hd","speech-2.8-turbo","speech-2.6-hd","speech-2.6-turbo","speech-02-hd","speech-02-turbo","speech-01-hd","speech-01-turbo",]:
         items["minimaxSubtitleCheckBox"].Enabled = True
     else:
         items["minimaxSubtitleCheckBox"].Checked = False
