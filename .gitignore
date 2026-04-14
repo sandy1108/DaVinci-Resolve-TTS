@@ -3,3 +3,5 @@
 
 # Configuration files
 /DaVinci Resolve TTS/config/TTS_settings.json
+
+/DaVinci Resolve TTS/__pycache__

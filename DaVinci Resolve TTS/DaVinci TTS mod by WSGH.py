@@ -1,7 +1,7 @@
 # ================= 用户配置 =================
 SCRIPT_NAME = "DaVinci TTS"
-SCRIPT_VERSION = " 3.5-WSGH"
-SCRIPT_AUTHOR = "HEIBA"
+SCRIPT_VERSION = " 3.6-WSGH"
+SCRIPT_AUTHOR = "HEIBA(mod by WSGH)"
 
 SCREEN_WIDTH = 1920
 SCREEN_HEIGHT = 1080
@@ -153,9 +153,21 @@ DEFAULT_SETTINGS = {
     "OpenAI_Format": 0,
     "OpenAI_Instruction":"",
     "OpenAI_Preset":0,
+
+    "SHOW_AZURE_TAB": False,
+    "SHOW_MINIMAX_TAB": True,
+    "SHOW_OPENAI_TAB": False,
+    "SHOW_CONFIG_TAB": True,
     
     "CN":True,
     "EN":False,
+}
+
+TAB_STACK_INDEX_MAP = {
+    "SHOW_AZURE_TAB": 0,
+    "SHOW_MINIMAX_TAB": 1,
+    "SHOW_OPENAI_TAB": 2,
+    "SHOW_CONFIG_TAB": 3,
 }
 import os
 import sys
@@ -651,7 +663,17 @@ def save_settings(settings, settings_file):
         content = json.dumps(settings, indent=4)
         file.write(content)
 
+def normalize_tab_visibility(settings):
+    normalized = {
+        key: settings.get(key, DEFAULT_SETTINGS[key])
+        for key in TAB_STACK_INDEX_MAP
+    }
+    if not any(normalized.values()):
+        normalized["SHOW_MINIMAX_TAB"] = True
+    return normalized
+
 saved_settings = load_settings(settings_file) 
+saved_tab_visibility = normalize_tab_visibility(saved_settings or {})
 
 
 
@@ -692,6 +714,25 @@ def get_first_empty_track(timeline, start_frame, end_frame, media_type):
             return track_index
         
         track_index += 1
+
+def ensure_subtitle_track_exists(timeline):
+    """确保时间线上至少存在一条字幕轨道。"""
+    sub_count = timeline.GetTrackCount("subtitle")
+    if sub_count and sub_count > 0:
+        return True
+
+    add_track = getattr(timeline, "AddTrack", None)
+    if callable(add_track):
+        try:
+            result = add_track("subtitle")
+            print(f"创建字幕轨道结果: {result}")
+            return bool(result)
+        except Exception as e:
+            print(f"创建字幕轨道失败: {e}")
+            return False
+
+    print("当前 API 不支持显式创建字幕轨道，继续尝试导入到字幕轨道 1。")
+    return True
 
 def load_audio_only_preset(project, keyword="audio only"):
     presets = project.GetRenderPresetList() or []
@@ -879,7 +920,7 @@ def adjust_srt_timestamps(srt_path, offset_frames, frame_rate, output_path=None)
         )
         
         # 加上偏移量
-        new_total_seconds = total_seconds + offset_seconds
+        new_total_seconds = max(0, total_seconds + offset_seconds)
         
         # 转换回时间格式
         new_hours = int(new_total_seconds // 3600)
@@ -944,7 +985,68 @@ def parse_srt_time_range(srt_path, frame_rate):
     return start_frame, end_frame
 
 
-def delete_overlapping_subtitles(timeline, start_frame, end_frame):
+def get_subtitle_items_snapshot(timeline):
+    """
+    获取当前时间线全部字幕片段快照，key 为 TimelineItem 的唯一 ID。
+    """
+    snapshot = {}
+    sub_count = timeline.GetTrackCount("subtitle")
+
+    for track_index in range(1, sub_count + 1):
+        items = timeline.GetItemListInTrack("subtitle", track_index) or []
+        for item in items:
+            try:
+                item_id = item.GetUniqueId()
+                if item_id:
+                    snapshot[item_id] = item
+            except Exception as e:
+                print(f"读取字幕片段快照失败: {e}")
+
+    return snapshot
+
+
+def get_new_subtitle_items(timeline, before_snapshot):
+    """
+    获取导入后新增的字幕片段列表。
+    """
+    after_snapshot = get_subtitle_items_snapshot(timeline)
+    before_ids = set(before_snapshot.keys())
+    new_items = [
+        item for item_id, item in after_snapshot.items()
+        if item_id not in before_ids
+    ]
+    new_items.sort(key=lambda item: item.GetStart())
+    return new_items
+
+
+def get_subtitle_items_range(items):
+    """
+    计算字幕片段列表的整体时间范围。
+    """
+    if not items:
+        return None, None
+
+    start_frame = None
+    end_frame = None
+
+    for item in items:
+        try:
+            item_start = item.GetStart()
+            item_end = item.GetEnd()
+        except Exception as e:
+            print(f"读取字幕片段范围失败: {e}")
+            continue
+
+        if item_start is None or item_end is None:
+            continue
+
+        start_frame = item_start if start_frame is None else min(start_frame, item_start)
+        end_frame = item_end if end_frame is None else max(end_frame, item_end)
+
+    return start_frame, end_frame
+
+
+def delete_overlapping_subtitles(timeline, start_frame, end_frame, alt_start_frame=None, alt_end_frame=None, exclude_item_ids=None):
     """
     删除与指定时间范围重叠的字幕片段
     
@@ -952,9 +1054,13 @@ def delete_overlapping_subtitles(timeline, start_frame, end_frame):
         timeline: 时间线对象
         start_frame: 开始帧
         end_frame: 结束帧
+        alt_start_frame: 备用开始帧（用于兼容不同时间基准）
+        alt_end_frame: 备用结束帧（用于兼容不同时间基准）
+        exclude_item_ids: 需要跳过删除的 TimelineItem ID 集合
     """
     sub_count = timeline.GetTrackCount("subtitle")
     total_deleted = 0
+    excluded_ids = set(exclude_item_ids or [])
     
     for track_index in range(1, sub_count + 1):
         items = timeline.GetItemListInTrack("subtitle", track_index)
@@ -963,12 +1069,21 @@ def delete_overlapping_subtitles(timeline, start_frame, end_frame):
             overlapping_items = []
             
             for item in items:
+                item_id = item.GetUniqueId() if hasattr(item, "GetUniqueId") else None
+                if item_id in excluded_ids:
+                    continue
+
                 item_start = item.GetStart()
                 item_end = item.GetEnd()
                 
                 # 检查是否重叠
                 # 重叠条件：NOT (item_end < start_frame OR item_start > end_frame)
-                if not (item_end < start_frame or item_start > end_frame):
+                primary_overlap = not (item_end < start_frame or item_start > end_frame)
+                alt_overlap = False
+                if alt_start_frame is not None and alt_end_frame is not None:
+                    alt_overlap = not (item_end < alt_start_frame or item_start > alt_end_frame)
+
+                if primary_overlap or alt_overlap:
                     overlapping_items.append(item)
                     print(f"  发现重叠字幕：轨道 {track_index}, 范围 {item_start}-{item_end}")
             
@@ -984,7 +1099,7 @@ def delete_overlapping_subtitles(timeline, start_frame, end_frame):
 
 def import_srt_to_timeline(srt_path, insert_position_frame=0):
     """
-    将字幕导入到时间线，支持时间偏移和增量替换
+    将字幕导入到时间线，支持按插入位置对齐和增量替换
     
     Args:
         srt_path: SRT 文件路径
@@ -1006,61 +1121,120 @@ def import_srt_to_timeline(srt_path, insert_position_frame=0):
         return False
     
     frame_rate = float(timeline.GetSetting("timelineFrameRate"))
-    
-    # 2. 调整 SRT 时间戳（加上偏移量）
-    if insert_position_frame > 0:
-        # 创建临时文件路径
-        adjusted_srt_path = srt_path.replace('.srt', '_adjusted.srt')
-        
-        # 调整时间戳
-        adjust_srt_timestamps(
-            srt_path=srt_path,
-            offset_frames=insert_position_frame,
-            frame_rate=frame_rate,
-            output_path=adjusted_srt_path
-        )
-        
-        # 使用调整后的文件
-        srt_path_to_import = adjusted_srt_path
-    else:
-        # 不需要偏移，直接使用原文件
-        srt_path_to_import = srt_path
-    
-    # 3. 解析调整后的时间范围
-    start_frame, end_frame = parse_srt_time_range(srt_path_to_import, frame_rate)
-    
-    if start_frame is None:
+    insert_position_frame = int(insert_position_frame or 0)
+
+    # 2. 解析原始 SRT 时间范围
+    relative_start_frame, relative_end_frame = parse_srt_time_range(srt_path, frame_rate)
+
+    if relative_start_frame is None:
         print("无法解析 SRT 时间范围")
         return False
-    
-    print(f"字幕时间范围：{start_frame} - {end_frame} 帧")
-    
-    # 4. 删除重叠的旧字幕（增量替换）
-    delete_overlapping_subtitles(timeline, start_frame, end_frame)
-    
-    # 5. 导入字幕到媒体池
+
+    expected_start_frame = insert_position_frame + relative_start_frame
+    expected_end_frame = insert_position_frame + relative_end_frame
+
+    print(f"字幕相对时间范围：{relative_start_frame} - {relative_end_frame} 帧")
+    print(f"预期字幕绝对时间范围：{expected_start_frame} - {expected_end_frame} 帧")
+
+    # 3. 导入字幕到媒体池
     media_pool = current_project.GetMediaPool()
     root_folder = media_pool.GetRootFolder()
     media_pool.SetCurrentFolder(root_folder)
 
     # 删除媒体池中同名旧条目，避免重复
-    file_name = os.path.basename(srt_path_to_import)
+    file_name = os.path.basename(srt_path)
     for clip in root_folder.GetClipList():
         if clip.GetName() == file_name:
             media_pool.DeleteClips([clip])
             break
 
-    imported = media_pool.ImportMedia([srt_path_to_import])
-    if not imported:
-        print(f"错误：字幕文件导入失败 -> {srt_path_to_import}")
+    def import_and_collect_new_items(import_path):
+        import_file_name = os.path.basename(import_path)
+        for clip in root_folder.GetClipList():
+            if clip.GetName() == import_file_name:
+                media_pool.DeleteClips([clip])
+                break
+
+        imported = media_pool.ImportMedia([import_path])
+        if not imported:
+            print(f"错误：字幕文件导入失败 -> {import_path}")
+            return None
+
+        before_snapshot = get_subtitle_items_snapshot(timeline)
+        new_clip = imported[0]
+        appended_items = media_pool.AppendToTimeline([new_clip])
+        if not appended_items:
+            print("错误：将字幕添加到时间线失败")
+            return None
+
+        new_items = get_new_subtitle_items(timeline, before_snapshot)
+        if not new_items:
+            print("未能通过时间线差分识别新字幕，回退到 AppendToTimeline 返回值。")
+            new_items = appended_items
+
+        return new_items
+
+    # 4. 首次导入字幕，并通过时间线差分识别完整的新字幕集合
+    new_items = import_and_collect_new_items(srt_path)
+    if not new_items:
         return False
 
-    # 6. 将导入的字幕追加到时间线
-    new_clip = imported[0]
-    success = media_pool.AppendToTimeline([new_clip])
-    if not success:
-        print("错误：将字幕添加到时间线失败")
-        return False
+    actual_start_frame, actual_end_frame = get_subtitle_items_range(new_items)
+    final_import_path = srt_path
+
+    if actual_start_frame is None or actual_end_frame is None:
+        print("无法读取 Resolve 实际插入位置，跳过位置校正。")
+    else:
+        print(f"Resolve 实际字幕范围：{actual_start_frame} - {actual_end_frame} 帧，共 {len(new_items)} 条")
+
+        position_delta = expected_start_frame - actual_start_frame
+        if position_delta != 0:
+            print(f"检测到字幕起点偏移：{position_delta} 帧，准备重新校正导入。")
+            timeline.DeleteClips(new_items)
+
+            adjusted_srt_path = srt_path.replace('.srt', '_positioned.srt')
+            adjust_srt_timestamps(
+                srt_path=srt_path,
+                offset_frames=position_delta,
+                frame_rate=frame_rate,
+                output_path=adjusted_srt_path
+            )
+
+            final_import_path = adjusted_srt_path
+            new_items = import_and_collect_new_items(final_import_path)
+            if not new_items:
+                return False
+
+            actual_start_frame, actual_end_frame = get_subtitle_items_range(new_items)
+            if actual_start_frame is not None and actual_end_frame is not None:
+                print(f"校正后字幕范围：{actual_start_frame} - {actual_end_frame} 帧，共 {len(new_items)} 条")
+
+    if actual_start_frame is None or actual_end_frame is None:
+        print("无法确认最终字幕范围，跳过旧字幕清理以避免误删。")
+        print(f"字幕已成功加载到时间线: {file_name}")
+        return True
+
+    if actual_start_frame != expected_start_frame:
+        print(f"字幕最终起点仍与目标不一致（目标 {expected_start_frame}，实际 {actual_start_frame}），跳过旧字幕清理以避免误删。")
+        print(f"字幕已成功加载到时间线: {file_name}")
+        return True
+
+    new_item_ids = set()
+    for item in new_items:
+        try:
+            item_id = item.GetUniqueId()
+            if item_id:
+                new_item_ids.add(item_id)
+        except Exception as e:
+            print(f"读取新字幕唯一 ID 失败: {e}")
+
+    # 5. 仅在位置确认正确后，再清理真正重叠的旧字幕
+    delete_overlapping_subtitles(
+        timeline,
+        actual_start_frame,
+        actual_end_frame,
+        exclude_item_ids=new_item_ids
+    )
 
     print(f"字幕已成功加载到时间线: {file_name}")
     return True
@@ -1197,6 +1371,11 @@ win = dispatcher.AddWindow({
                                 ui.Button({"ID": "minimaxPreviewButton", "Text": "试听","Weight": 0.1}),
                                 ui.Button({"ID": "ShowMiniMaxClone", "Text": "","Weight": 0.1}),
                                 ui.Button({"ID": "minimaxDeleteVoice", "Text": "","Weight": 0.1}),
+                            ]),
+                            ui.HGroup({}, [
+                                ui.Button({"ID": "QuickBrowseButton", "Text": "保存路径", "Weight": 0.34}),
+                                ui.Button({"ID": "QuickMiniMaxConfigButton", "Text": "配置", "Weight": 0.33}),
+                                ui.Button({"ID": "TabVisibilityButton", "Text": "标签页", "Weight": 0.33}),
                             ]),
                             ui.HGroup({}, [
                                 ui.Label({"ID": "minimaxSoundEffectLabel","Text": "音效:", "Weight": 0.2}),
@@ -1517,6 +1696,38 @@ minimax_clone_window = dispatcher.AddWindow(
     )
 )
 
+tab_visibility_window = dispatcher.AddWindow(
+    {
+        "ID": "TabVisibilityWin",
+        "WindowTitle": "Tab Visibility",
+        "Geometry": [X_CENTER, Y_CENTER, 360, 240],
+        "Hidden": True,
+        "StyleSheet": """
+        * {
+            font-size: 14px;
+        }
+    """
+    },
+    [
+        ui.VGroup(
+            [
+                ui.Label({"ID": "TabVisibilityLabel", "Text": "标签页显示设置", "Alignment": {"AlignHCenter": True, "AlignVCenter": True}}),
+                ui.Label({"ID": "TabVisibilityHintLabel", "Text": "修改后重启脚本生效，且至少保留一个标签页可见。", "WordWrap": True}),
+                ui.CheckBox({"ID": "ShowAzureTabCheckBox", "Text": "显示 Azure 标签页", "Checked": False}),
+                ui.CheckBox({"ID": "ShowMiniMaxTabCheckBox", "Text": "显示 MiniMax 标签页", "Checked": True}),
+                ui.CheckBox({"ID": "ShowOpenAITabCheckBox", "Text": "显示 OpenAI 标签页", "Checked": False}),
+                ui.CheckBox({"ID": "ShowConfigTabCheckBox", "Text": "显示配置标签页", "Checked": False}),
+                ui.HGroup(
+                    [
+                        ui.Button({"ID": "TabVisibilityConfirm", "Text": "确定", "Weight": 1}),
+                        ui.Button({"ID": "TabVisibilityCancel", "Text": "取消", "Weight": 1}),
+                    ]
+                ),
+            ]
+        )
+    ]
+)
+
 translations = {
     "cn": {
         "Tabs": ["微软语音", "MiniMax语音", "OpenAI 语音","配置"],
@@ -1537,6 +1748,9 @@ translations = {
         "OpenAIPreviewButton": "试听",
         "OpenAIInstructionLabel": "指令",
         "minimaxPreviewButton":"试听",
+        "QuickBrowseButton":"保存路径",
+        "QuickMiniMaxConfigButton":"配置",
+        "TabVisibilityButton":"标签页",
         "LanguageLabel": "语言",
         "NameTypeLabel": "类型",
         "NameLabel": "名称",
@@ -1607,6 +1821,14 @@ translations = {
         "OpenAIApiKeyLabel":"密钥",
         "OpenAIConfirm":"确定",
         "OpenAIRegisterButton":"注册",
+        "TabVisibilityLabel":"标签页显示设置",
+        "TabVisibilityHintLabel":"修改后重启脚本生效，且至少保留一个标签页可见。",
+        "ShowAzureTabCheckBox":"显示 Azure 标签页",
+        "ShowMiniMaxTabCheckBox":"显示 MiniMax 标签页",
+        "ShowOpenAITabCheckBox":"显示 OpenAI 标签页",
+        "ShowConfigTabCheckBox":"显示配置标签页",
+        "TabVisibilityConfirm":"确定",
+        "TabVisibilityCancel":"取消",
 
     },
 
@@ -1630,6 +1852,9 @@ translations = {
         "OpenAIInstructionLabel": "Instruction",
         "openGuideButton":"Usage Tutorial",
         "minimaxPreviewButton":"Preview",
+        "QuickBrowseButton":"Save Path",
+        "QuickMiniMaxConfigButton":"Config",
+        "TabVisibilityButton":"Tabs",
         "LanguageLabel": "Language",
         "NameTypeLabel": "Type",
         "NameLabel": "Name",
@@ -1699,6 +1924,14 @@ translations = {
         "OpenAIApiKeyLabel":"Key",
         "OpenAIConfirm":"OK",
         "OpenAIRegisterButton":"Register",
+        "TabVisibilityLabel":"Tab Visibility",
+        "TabVisibilityHintLabel":"Changes take effect after restarting the script, and at least one tab must remain visible.",
+        "ShowAzureTabCheckBox":"Show Azure tab",
+        "ShowMiniMaxTabCheckBox":"Show MiniMax tab",
+        "ShowOpenAITabCheckBox":"Show OpenAI tab",
+        "ShowConfigTabCheckBox":"Show Config tab",
+        "TabVisibilityConfirm":"OK",
+        "TabVisibilityCancel":"Cancel",
     }
 }
 items = win.GetItems()
@@ -1706,8 +1939,18 @@ azure_items = azure_config_window.GetItems()
 minimax_items = minimax_config_window.GetItems()
 openai_items = openai_config_window.GetItems()
 minimax_clone_items = minimax_clone_window.GetItems()
+tab_visibility_items = tab_visibility_window.GetItems()
 msgbox_items = msgbox.GetItems()
-items["MyStack"].CurrentIndex = 0
+VISIBLE_TAB_STACK_INDICES = [
+    stack_index
+    for setting_key, stack_index in TAB_STACK_INDEX_MAP.items()
+    if saved_tab_visibility.get(setting_key, False)
+]
+if not VISIBLE_TAB_STACK_INDICES:
+    VISIBLE_TAB_STACK_INDICES = [TAB_STACK_INDEX_MAP["SHOW_MINIMAX_TAB"]]
+for stack_index in VISIBLE_TAB_STACK_INDICES:
+    items["MyTabs"].AddTab(translations["cn"]["Tabs"][stack_index])
+items["MyStack"].CurrentIndex = VISIBLE_TAB_STACK_INDICES[0]
 
 def show_warning_message(status_tuple):
     use_english = items["LangEnCheckBox"].Checked
@@ -1718,9 +1961,6 @@ def show_warning_message(status_tuple):
 def on_msg_ok_clicked(ev):
     msgbox.Hide()   
 msgbox.On.OkButton.Clicked = on_msg_ok_clicked
-
-for tab_name in translations["cn"]["Tabs"]:
-    items["MyTabs"].AddTab(tab_name)
 
 def toggle_api_checkboxes(unuse_api_checked):
     azure_items["ApiKey"].Enabled = unuse_api_checked
@@ -2056,8 +2296,8 @@ def switch_language(lang):
     items["minimaxSoundEffectCombo"].Clear()
 
     if "MyTabs" in items:
-        for index, new_name in enumerate(translations[lang]["Tabs"]):
-            items["MyTabs"].SetTabText(index, new_name)
+        for tab_index, stack_index in enumerate(VISIBLE_TAB_STACK_INDICES):
+            items["MyTabs"].SetTabText(tab_index, translations[lang]["Tabs"][stack_index])
 
     for item_id, text_value in translations[lang].items():
         # 确保 items[item_id] 存在，否则会报 KeyError
@@ -2073,6 +2313,8 @@ def switch_language(lang):
             openai_items[item_id].Text = text_value
         elif item_id in minimax_clone_items:    
             minimax_clone_items[item_id].Text = text_value
+        elif item_id in tab_visibility_items:
+            tab_visibility_items[item_id].Text = text_value
         else:
             print(f"[Warning] items 中不存在 ID 为 {item_id} 的控件，无法设置文本！")
 
@@ -2188,6 +2430,11 @@ if saved_settings:
     items["OpenAIFormatCombo"].CurrentIndex = saved_settings.get("OpenAI_Format", DEFAULT_SETTINGS["OpenAI_Format"])
     items["OpenAIInstructionText"].Text = saved_settings.get("OpenAI_Instruction", DEFAULT_SETTINGS["OpenAI_Instruction"])
 
+tab_visibility_items["ShowAzureTabCheckBox"].Checked = saved_tab_visibility["SHOW_AZURE_TAB"]
+tab_visibility_items["ShowMiniMaxTabCheckBox"].Checked = saved_tab_visibility["SHOW_MINIMAX_TAB"]
+tab_visibility_items["ShowOpenAITabCheckBox"].Checked = saved_tab_visibility["SHOW_OPENAI_TAB"]
+tab_visibility_items["ShowConfigTabCheckBox"].Checked = saved_tab_visibility["SHOW_CONFIG_TAB"]
+
 def flagmark():
     global flag
     flag = True
@@ -2300,7 +2547,9 @@ def on_volume_spinbox_value_changed(ev):
 win.On.VolumeSpinBox.ValueChanged = on_volume_spinbox_value_changed
 
 def on_my_tabs_current_changed(ev):
-    items["MyStack"].CurrentIndex = ev["Index"]
+    tab_index = ev["Index"]
+    if 0 <= tab_index < len(VISIBLE_TAB_STACK_INDICES):
+        items["MyStack"].CurrentIndex = VISIBLE_TAB_STACK_INDICES[tab_index]
 win.On.MyTabs.CurrentChanged = on_my_tabs_current_changed
 
 def on_subtitle_text_changed(ev):
@@ -3285,12 +3534,13 @@ def process_minimax_request(text_func, timeline_func):
         show_warning_message(status_tuple)
         return
 
+    start_frame, end_frame = timeline_func()
+
     # Save audio
     filename = generate_filename(save_path, text, f".{items['minimaxFormatCombo'].CurrentText}")
     try:
         with open(filename, "wb") as f:
             f.write(result["audio_content"])
-        start_frame, end_frame = timeline_func()
         add_to_media_pool_and_timeline(start_frame, end_frame, filename)
     except IOError as e:
         print(f"Failed to write audio file: {e}")
@@ -3311,7 +3561,7 @@ def process_minimax_request(text_func, timeline_func):
                     json_data = json.load(f)
                 
                 json_to_srt(json_data, srt_path)
-                import_srt_to_timeline(srt_path)
+                import_srt_to_timeline(srt_path, start_frame)
                 os.remove(subtitle_json_path) # Clean up temp json
             except (IOError, json.JSONDecodeError) as e:
                 print(f"Failed to process subtitle file: {e}")
@@ -3506,8 +3756,52 @@ def on_browse_button_clicked(ev):
     else:
         print("No directory selected or the request failed.")
 win.On.Browse.Clicked = on_browse_button_clicked
+win.On.QuickBrowseButton.Clicked = on_browse_button_clicked
+
+def on_show_tab_visibility(ev):
+    tab_visibility_window.Show()
+
+def on_tab_visibility_close(ev):
+    tab_visibility_window.Hide()
+
+def on_tab_visibility_confirm(ev):
+    selected_count = sum([
+        tab_visibility_items["ShowAzureTabCheckBox"].Checked,
+        tab_visibility_items["ShowMiniMaxTabCheckBox"].Checked,
+        tab_visibility_items["ShowOpenAITabCheckBox"].Checked,
+        tab_visibility_items["ShowConfigTabCheckBox"].Checked,
+    ])
+    if selected_count == 0:
+        show_warning_message((
+            "At least one tab must remain visible.",
+            "至少需要保留一个显示中的标签页。"
+        ))
+        return
+    close_and_save(settings_file)
+    tab_visibility_window.Hide()
+    show_warning_message((
+        "Tab visibility saved. Restart the script to apply changes.",
+        "标签页显示设置已保存，重启脚本后生效。"
+    ))
+
+win.On.TabVisibilityButton.Clicked = on_show_tab_visibility
+tab_visibility_window.On.TabVisibilityConfirm.Clicked = on_tab_visibility_confirm
+tab_visibility_window.On.TabVisibilityCancel.Clicked = on_tab_visibility_close
+tab_visibility_window.On.TabVisibilityWin.Close = on_tab_visibility_close
 
 def close_and_save(settings_file):
+    tab_visibility = {
+        "SHOW_AZURE_TAB": tab_visibility_items["ShowAzureTabCheckBox"].Checked,
+        "SHOW_MINIMAX_TAB": tab_visibility_items["ShowMiniMaxTabCheckBox"].Checked,
+        "SHOW_OPENAI_TAB": tab_visibility_items["ShowOpenAITabCheckBox"].Checked,
+        "SHOW_CONFIG_TAB": tab_visibility_items["ShowConfigTabCheckBox"].Checked,
+    }
+    tab_visibility = normalize_tab_visibility(tab_visibility)
+    tab_visibility_items["ShowAzureTabCheckBox"].Checked = tab_visibility["SHOW_AZURE_TAB"]
+    tab_visibility_items["ShowMiniMaxTabCheckBox"].Checked = tab_visibility["SHOW_MINIMAX_TAB"]
+    tab_visibility_items["ShowOpenAITabCheckBox"].Checked = tab_visibility["SHOW_OPENAI_TAB"]
+    tab_visibility_items["ShowConfigTabCheckBox"].Checked = tab_visibility["SHOW_CONFIG_TAB"]
+
     settings = {
         "API_KEY": azure_items["ApiKey"].Text,
         "REGION": azure_items["Region"].Text,
@@ -3546,6 +3840,11 @@ def close_and_save(settings_file):
         "OpenAI_Instruction":items["OpenAIInstructionText"].PlainText,
         "OpenAI_Preset":items["OpenAIPresetCombo"].CurrentIndex,
 
+        "SHOW_AZURE_TAB": tab_visibility["SHOW_AZURE_TAB"],
+        "SHOW_MINIMAX_TAB": tab_visibility["SHOW_MINIMAX_TAB"],
+        "SHOW_OPENAI_TAB": tab_visibility["SHOW_OPENAI_TAB"],
+        "SHOW_CONFIG_TAB": tab_visibility["SHOW_CONFIG_TAB"],
+
         "CN":items["LangCnCheckBox"].Checked,
         "EN":items["LangEnCheckBox"].Checked,
         
@@ -3580,6 +3879,7 @@ win.On.ShowAzure.Clicked = on_show_azure
 def on_show_minimax(ev):
     minimax_config_window.Show()
 win.On.ShowMiniMax.Clicked = on_show_minimax
+win.On.QuickMiniMaxConfigButton.Clicked = on_show_minimax
 
 def on_show_minimax_clone(ev):
     minimax_clone_items["minimaxNeedNoiseReduction"].Enabled = not minimax_clone_items["minimaxOnlyAddID"].Checked
