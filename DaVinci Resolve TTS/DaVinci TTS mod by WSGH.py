@@ -177,6 +177,7 @@ import re
 import time
 import wave
 import json
+import copy
 import threading
 import webbrowser
 from xml.dom import minidom
@@ -313,15 +314,22 @@ retries = Retry(
 session.mount('http://', HTTPAdapter(max_retries=retries))
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
-def check_or_create_file(file_path):
+def ensure_json_file(file_path, default_content=None):
+    if default_content is None:
+        default_content = {}
+
+    parent_dir = os.path.dirname(file_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
     if os.path.exists(file_path):
-        pass
-    else:
-        try:
-            with open(file_path, 'w') as file:
-                json.dump({}, file)  
-        except IOError:
-            raise Exception(f"Cannot create file: {file_path}")
+        return
+
+    try:
+        with open(file_path, 'w', encoding='utf-8') as file:
+            json.dump(default_content, file, ensure_ascii=False, indent=4)
+    except IOError:
+        raise Exception(f"Cannot create file: {file_path}")
         
 def load_resource(file_path: str) -> str:
     if not os.path.exists(file_path):
@@ -637,32 +645,77 @@ class AzureTTSProvider:
         return False, "Unknown Azure preview error."
 
 config_dir = os.path.join(SCRIPT_PATH, 'config')
-settings_file = os.path.join(config_dir, 'TTS_settings.json')
+prefs_dir = os.path.join(SCRIPT_PATH, 'prefs')
+prefs_file = os.path.join(prefs_dir, 'user_prefs.json')
 STATUS_FILE = os.path.join(config_dir, 'status.json')
 SCRIPT_INFO_CN  = load_resource(os.path.join(config_dir, "script_info_cn.html"))
 SCRIPT_INFO_EN  = load_resource(os.path.join(config_dir, "script_info_en.html"))
 MINIMAX_CLONE_INFO_CN = load_resource(os.path.join(config_dir, "script_clone_info_cn.html"))
 MINIMAX_CLONE_INFO_EN = load_resource(os.path.join(config_dir, "script_clone_info_en.html"))
 
-check_or_create_file(settings_file)
+DEFAULT_PREFS = {
+    "schema_version": 1,
+    "settings": {},
+    "minimax_clone_voices": [],
+}
 
-def load_settings(settings_file):
-    if os.path.exists(settings_file):
-        with open(settings_file, 'r') as file:
-            content = file.read()
-            if content:
-                try:
-                    settings = json.loads(content)
-                    return settings
-                except json.JSONDecodeError as err:
-                    print('Error decoding settings:', err)
-                    return None
-    return None
+ensure_json_file(prefs_file, DEFAULT_PREFS)
 
-def save_settings(settings, settings_file):
-    with open(settings_file, 'w') as file:
-        content = json.dumps(settings, indent=4)
-        file.write(content)
+def load_prefs(prefs_path):
+    if not os.path.exists(prefs_path):
+        return copy.deepcopy(DEFAULT_PREFS)
+
+    try:
+        with open(prefs_path, 'r', encoding='utf-8') as file:
+            content = file.read().strip()
+    except IOError as err:
+        print('Error reading prefs:', err)
+        return copy.deepcopy(DEFAULT_PREFS)
+
+    if not content:
+        return copy.deepcopy(DEFAULT_PREFS)
+
+    try:
+        prefs = json.loads(content)
+    except json.JSONDecodeError as err:
+        print('Error decoding prefs:', err)
+        return copy.deepcopy(DEFAULT_PREFS)
+
+    if not isinstance(prefs, dict):
+        return copy.deepcopy(DEFAULT_PREFS)
+
+    normalized = copy.deepcopy(DEFAULT_PREFS)
+    normalized["schema_version"] = prefs.get("schema_version", DEFAULT_PREFS["schema_version"])
+
+    settings = prefs.get("settings", {})
+    normalized["settings"] = settings if isinstance(settings, dict) else {}
+
+    clone_voices = prefs.get("minimax_clone_voices", [])
+    normalized["minimax_clone_voices"] = clone_voices if isinstance(clone_voices, list) else []
+    return normalized
+
+def save_prefs(prefs, prefs_path):
+    ensure_json_file(prefs_path, DEFAULT_PREFS)
+    normalized = copy.deepcopy(DEFAULT_PREFS)
+    if isinstance(prefs, dict):
+        normalized["schema_version"] = prefs.get("schema_version", DEFAULT_PREFS["schema_version"])
+        settings = prefs.get("settings", {})
+        normalized["settings"] = settings if isinstance(settings, dict) else {}
+        clone_voices = prefs.get("minimax_clone_voices", [])
+        normalized["minimax_clone_voices"] = clone_voices if isinstance(clone_voices, list) else []
+
+    temp_path = prefs_path + ".tmp"
+    with open(temp_path, 'w', encoding='utf-8') as file:
+        json.dump(normalized, file, ensure_ascii=False, indent=4)
+    os.replace(temp_path, prefs_path)
+
+def load_settings(prefs_path):
+    return load_prefs(prefs_path).get("settings", {})
+
+def save_settings(settings, prefs_path):
+    prefs = load_prefs(prefs_path)
+    prefs["settings"] = settings if isinstance(settings, dict) else {}
+    save_prefs(prefs, prefs_path)
 
 def normalize_tab_visibility(settings):
     normalized = {
@@ -674,8 +727,10 @@ def normalize_tab_visibility(settings):
         normalized["SHOW_CONFIG_TAB"] = True
     return normalized
 
-saved_settings = load_settings(settings_file) 
+saved_prefs = load_prefs(prefs_file)
+saved_settings = saved_prefs.get("settings", {})
 saved_tab_visibility = normalize_tab_visibility(saved_settings or {})
+saved_clone_voices = saved_prefs.get("minimax_clone_voices", [])
 
 
 
@@ -2083,18 +2138,18 @@ minimax_voice_index_initialized = False
 
 
 
-# 加载Voice
-voice_file = os.path.join(config_dir, 'voices_list.json')
-if not os.path.exists(voice_file):
+# 加载系统音色资源
+system_voice_file = os.path.join(config_dir, 'voices_list.json')
+if not os.path.exists(system_voice_file):
     show_warning_message(STATUS_MESSAGES.voices_list)
-with open(voice_file, "r", encoding="utf-8") as file:
+with open(system_voice_file, "r", encoding="utf-8") as file:
     voices_data = json.load(file)
 
 AZURE_VOICES = voices_data.get("azure_voice", {})
 EDGETTS_VOICES = voices_data.get("edge_voice", {})
 OPENAI_VOICES = voices_data.get("openai_voice", {}).get("voices", [])
 MINIMAX_VOICES = voices_data.get("minimax_system_voice", [])
-MINIMAX_CLONE_VOICES = voices_data.get("minimax_clone_voices", [])
+MINIMAX_CLONE_VOICES = saved_clone_voices
 
 OPENAI_PRESET_FILE = os.path.join(config_dir, 'instruction.json')
 
@@ -3336,28 +3391,23 @@ def json_to_srt(json_data, srt_path):
     except Exception as e:
         print(f"保存 SRT 文件失败: {e}")
 
-def load_clone_data(voice_file: str) -> Dict[str, Any]:
+def load_clone_data(prefs_path: str) -> Dict[str, Any]:
     """
-    读取 JSON 文件，返回包含 key 'minimax_clone_voices' 的字典
-    若文件不存在或解析失败，则返回空 dict 并初始化该 key
+    读取用户偏好文件，返回包含 settings 与 minimax_clone_voices 的字典。
     """
-    try:
-        with open(voice_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except (IOError, json.JSONDecodeError):
-        data = {}
+    data = load_prefs(prefs_path)
+    data.setdefault("settings", {})
     data.setdefault("minimax_clone_voices", [])
     return data
 
-def save_clone_data(voice_file: str, data: Dict[str, Any]) -> None:
+def save_clone_data(prefs_path: str, data: Dict[str, Any]) -> None:
     """
-    将 data 写回 voice_file，格式化输出
+    将用户克隆音色数据写回用户偏好文件，并保留现有 settings。
     """
     try:
-        with open(voice_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        save_prefs(data, prefs_path)
     except IOError:
-        raise Exception(f"Cannot write to file: {voice_file}")
+        raise Exception(f"Cannot write to file: {prefs_path}")
 
 def refresh_voice_combo(
     items: Dict[str, Any],
@@ -3381,7 +3431,7 @@ def refresh_voice_combo(
             combo.AddItem(v["voice_name"])
 
 def add_clone_voice(
-    voice_file: str,
+    prefs_path: str,
     voice_name: str,
     voice_id: str,
     items: Dict[str, Any],
@@ -3389,7 +3439,7 @@ def add_clone_voice(
     minimax_voices: List[Dict[str, str]],
 ) -> List[Dict[str, str]]:
     # 1. 加载现有数据
-    data = load_clone_data(voice_file)
+    data = load_clone_data(prefs_path)
 
     # 2. 重复检查
     for v in data["minimax_clone_voices"]:
@@ -3408,7 +3458,7 @@ def add_clone_voice(
     data["minimax_clone_voices"].insert(0, new_voice)
 
     # 4. 保存并刷新 UI
-    save_clone_data(voice_file, data)
+    save_clone_data(prefs_path, data)
     refresh_voice_combo(items, data["minimax_clone_voices"], minimax_voices)
     minimax_clone_items["minimaxCloneFileID"].Text = ""
     win.Show()
@@ -3418,14 +3468,14 @@ def add_clone_voice(
     return data["minimax_clone_voices"]
 
 def delete_clone_voice(
-    voice_file: str,
+    prefs_path: str,
     voice_name: str,
     items: Dict[str, Any],
     minimax_clone_voices: List[Dict[str, str]],
     minimax_voices: List[Dict[str, str]],
 ) -> List[Dict[str, str]]:
     # 1. 加载现有数据
-    data = load_clone_data(voice_file)
+    data = load_clone_data(prefs_path)
     original = data["minimax_clone_voices"]
 
     # 2. 过滤出所有不匹配的条目（strip + lower 匹配）
@@ -3442,7 +3492,7 @@ def delete_clone_voice(
 
     # 4. 保存并刷新 UI
     data["minimax_clone_voices"] = filtered
-    save_clone_data(voice_file, data)
+    save_clone_data(prefs_path, data)
     refresh_voice_combo(items, filtered, minimax_voices)
 
     show_warning_message(STATUS_MESSAGES.delete_clone_succeed)
@@ -3452,7 +3502,7 @@ def on_delete_minimax_clone_voice(ev):
     global MINIMAX_CLONE_VOICES
     voice_name = items["minimaxVoiceCombo"].CurrentText.strip()
     MINIMAX_CLONE_VOICES = delete_clone_voice(
-            voice_file=voice_file,
+            prefs_path=prefs_file,
             voice_name=voice_name,
             items=items,
             minimax_clone_voices=MINIMAX_CLONE_VOICES,
@@ -3492,7 +3542,7 @@ def on_minimax_clone_confirm(ev):
     # 3. Handle "Add ID Only" mode
     if minimax_clone_items["minimaxOnlyAddID"].Checked:
         MINIMAX_CLONE_VOICES = add_clone_voice(
-            voice_file=voice_file, voice_name=voice_name, voice_id=voice_id, items=items,
+            prefs_path=prefs_file, voice_name=voice_name, voice_id=voice_id, items=items,
             minimax_clone_voices=MINIMAX_CLONE_VOICES, minimax_voices=MINIMAX_VOICES
         )
         return
@@ -3559,7 +3609,7 @@ def on_minimax_clone_confirm(ev):
             add_to_media_pool_and_timeline(current_timeline.GetStartFrame(), current_timeline.GetEndFrame(), demo_path)
 
     MINIMAX_CLONE_VOICES = add_clone_voice(
-        voice_file=voice_file, voice_name=voice_name, voice_id=voice_id, items=items,
+        prefs_path=prefs_file, voice_name=voice_name, voice_id=voice_id, items=items,
         minimax_clone_voices=MINIMAX_CLONE_VOICES, minimax_voices=MINIMAX_VOICES
     )
     show_warning_message(STATUS_MESSAGES.clone_success)
@@ -3910,7 +3960,7 @@ def on_tab_visibility_confirm(ev):
             "至少需要保留一个显示中的标签页。"
         ))
         return
-    close_and_save(settings_file)
+    close_and_save(prefs_file)
     tab_visibility_window.Hide()
     show_warning_message((
         "Tab visibility saved. Restart the script to apply changes.",
@@ -3922,7 +3972,7 @@ tab_visibility_window.On.TabVisibilityConfirm.Clicked = on_tab_visibility_confir
 tab_visibility_window.On.TabVisibilityCancel.Clicked = on_tab_visibility_close
 tab_visibility_window.On.TabVisibilityWin.Close = on_tab_visibility_close
 
-def close_and_save(settings_file):
+def close_and_save(prefs_path):
     tab_visibility = {
         "SHOW_AZURE_TAB": tab_visibility_items["ShowAzureTabCheckBox"].Checked,
         "SHOW_MINIMAX_TAB": tab_visibility_items["ShowMiniMaxTabCheckBox"].Checked,
@@ -3984,7 +4034,7 @@ def close_and_save(settings_file):
         
     }
 
-    save_settings(settings, settings_file)
+    save_settings(settings, prefs_path)
 
 def on_open_link_button_clicked(ev):
     if items["LangEnCheckBox"].Checked :
@@ -4146,7 +4196,7 @@ def on_close(ev):
     for frame_id, info in markers.items():
         if info.get("customData") == "clone":
             current_timeline.DeleteMarkerAtFrame(frame_id)
-    close_and_save(settings_file)
+    close_and_save(prefs_file)
     import shutil
     for temp_dir in [AUDIO_TEMP_DIR]:
         if os.path.exists(temp_dir):
