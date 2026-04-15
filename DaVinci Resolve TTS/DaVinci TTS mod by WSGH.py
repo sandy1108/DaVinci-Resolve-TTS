@@ -115,7 +115,8 @@ OPENAI_MODELS = [
 ]
 
 DEFAULT_SETTINGS = {
-    "Path": "",
+    "BASE_PATH": "",
+    "AUTO_CREATE_PROJECT_SUBDIR": True,
     "UNUSE_API":False,
     "API_KEY": '',
     "REGION": '',
@@ -668,8 +669,9 @@ def normalize_tab_visibility(settings):
         key: settings.get(key, DEFAULT_SETTINGS[key])
         for key in TAB_STACK_INDEX_MAP
     }
+    normalized["SHOW_CONFIG_TAB"] = True
     if not any(normalized.values()):
-        normalized["SHOW_MINIMAX_TAB"] = True
+        normalized["SHOW_CONFIG_TAB"] = True
     return normalized
 
 saved_settings = load_settings(settings_file) 
@@ -694,6 +696,56 @@ def connect_resolve():
     return resolve, project,timeline
 
 resolve, current_project,current_timeline = connect_resolve()
+
+def get_current_project_name():
+    try:
+        project_manager = resolve.GetProjectManager()
+        project = project_manager.GetCurrentProject() if project_manager else None
+    except Exception as err:
+        print(f"获取当前工程失败: {err}")
+        return None
+
+    if not project:
+        return None
+
+    project_name = project.GetName()
+    return str(project_name).strip() if project_name else None
+
+def sanitize_folder_name(folder_name):
+    if folder_name is None:
+        return "UntitledProject"
+
+    safe_name = str(folder_name).strip()
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', safe_name)
+    safe_name = safe_name.rstrip(". ")
+    return safe_name or "UntitledProject"
+
+def get_effective_save_path(create_dir=False, show_warning=True):
+    base_path = items["Path"].Text.strip()
+    if not base_path:
+        if show_warning:
+            show_warning_message(STATUS_MESSAGES.select_save_path)
+        return None
+
+    final_path = base_path
+    if items["AutoProjectSubdirCheckBox"].Checked:
+        project_name = get_current_project_name()
+        if not project_name:
+            if show_warning:
+                show_warning_message(STATUS_MESSAGES.project_name_unavailable)
+            return None
+        final_path = os.path.join(base_path, sanitize_folder_name(project_name))
+
+    if create_dir:
+        try:
+            os.makedirs(final_path, exist_ok=True)
+        except OSError as err:
+            print(f"创建保存目录失败: {err}")
+            if show_warning:
+                show_warning_message(STATUS_MESSAGES.save_dir_failed)
+            return None
+
+    return final_path
 
 def get_first_empty_track(timeline, start_frame, end_frame, media_type):
     """获取当前播放头位置的第一个空轨道索引"""
@@ -1136,21 +1188,41 @@ def import_srt_to_timeline(srt_path, insert_position_frame=0):
     print(f"字幕相对时间范围：{relative_start_frame} - {relative_end_frame} 帧")
     print(f"预期字幕绝对时间范围：{expected_start_frame} - {expected_end_frame} 帧")
 
-    # 3. 导入字幕到媒体池
+    # 3. 导入字幕到媒体池的 SRT 子文件夹
     media_pool = current_project.GetMediaPool()
     root_folder = media_pool.GetRootFolder()
-    media_pool.SetCurrentFolder(root_folder)
+    srt_folder = None
+    for folder in root_folder.GetSubFolderList():
+        if folder.GetName() == "SRT":
+            srt_folder = folder
+            break
+
+    if not srt_folder:
+        srt_folder = media_pool.AddSubFolder(root_folder, "SRT")
+
+    if srt_folder:
+        media_pool.SetCurrentFolder(srt_folder)
+        print(f"SRT folder is available: {srt_folder.GetName()}")
+    else:
+        media_pool.SetCurrentFolder(root_folder)
+        print("创建或定位 SRT 媒体池文件夹失败，回退到 Master 导入字幕。")
 
     # 删除媒体池中同名旧条目，避免重复
     file_name = os.path.basename(srt_path)
-    for clip in root_folder.GetClipList():
+    target_folder = srt_folder if srt_folder else root_folder
+    for clip in target_folder.GetClipList():
         if clip.GetName() == file_name:
             media_pool.DeleteClips([clip])
             break
 
+    original_timecode = timeline.GetCurrentTimecode()
+    is_drop_frame = ";" in original_timecode if original_timecode else False
+    target_timecode = frames_to_resolve_timecode(insert_position_frame, frame_rate, is_drop_frame)
+
     def import_and_collect_new_items(import_path):
         import_file_name = os.path.basename(import_path)
-        for clip in root_folder.GetClipList():
+        media_pool.SetCurrentFolder(target_folder)
+        for clip in target_folder.GetClipList():
             if clip.GetName() == import_file_name:
                 media_pool.DeleteClips([clip])
                 break
@@ -1162,6 +1234,7 @@ def import_srt_to_timeline(srt_path, insert_position_frame=0):
 
         before_snapshot = get_subtitle_items_snapshot(timeline)
         new_clip = imported[0]
+        timeline.SetCurrentTimecode(target_timecode)
         appended_items = media_pool.AppendToTimeline([new_clip])
         if not appended_items:
             print("错误：将字幕添加到时间线失败")
@@ -1177,6 +1250,8 @@ def import_srt_to_timeline(srt_path, insert_position_frame=0):
     # 4. 首次导入字幕，并通过时间线差分识别完整的新字幕集合
     new_items = import_and_collect_new_items(srt_path)
     if not new_items:
+        if original_timecode:
+            timeline.SetCurrentTimecode(original_timecode)
         return False
 
     actual_start_frame, actual_end_frame = get_subtitle_items_range(new_items)
@@ -1192,17 +1267,23 @@ def import_srt_to_timeline(srt_path, insert_position_frame=0):
             print(f"检测到字幕起点偏移：{position_delta} 帧，准备重新校正导入。")
             timeline.DeleteClips(new_items)
 
-            adjusted_srt_path = srt_path.replace('.srt', '_positioned.srt')
-            adjust_srt_timestamps(
-                srt_path=srt_path,
-                offset_frames=position_delta,
-                frame_rate=frame_rate,
-                output_path=adjusted_srt_path
-            )
+            if position_delta < 0:
+                print("检测到负向偏移，继续通过回到目标播放头位置重新导入，避免生成负时间戳导致字幕头部丢失。")
+                final_import_path = srt_path
+            else:
+                adjusted_srt_path = srt_path.replace('.srt', '_positioned.srt')
+                adjust_srt_timestamps(
+                    srt_path=srt_path,
+                    offset_frames=position_delta,
+                    frame_rate=frame_rate,
+                    output_path=adjusted_srt_path
+                )
+                final_import_path = adjusted_srt_path
 
-            final_import_path = adjusted_srt_path
             new_items = import_and_collect_new_items(final_import_path)
             if not new_items:
+                if original_timecode:
+                    timeline.SetCurrentTimecode(original_timecode)
                 return False
 
             actual_start_frame, actual_end_frame = get_subtitle_items_range(new_items)
@@ -1211,11 +1292,15 @@ def import_srt_to_timeline(srt_path, insert_position_frame=0):
 
     if actual_start_frame is None or actual_end_frame is None:
         print("无法确认最终字幕范围，跳过旧字幕清理以避免误删。")
+        if original_timecode:
+            timeline.SetCurrentTimecode(original_timecode)
         print(f"字幕已成功加载到时间线: {file_name}")
         return True
 
     if actual_start_frame != expected_start_frame:
         print(f"字幕最终起点仍与目标不一致（目标 {expected_start_frame}，实际 {actual_start_frame}），跳过旧字幕清理以避免误删。")
+        if original_timecode:
+            timeline.SetCurrentTimecode(original_timecode)
         print(f"字幕已成功加载到时间线: {file_name}")
         return True
 
@@ -1235,6 +1320,9 @@ def import_srt_to_timeline(srt_path, insert_position_frame=0):
         actual_end_frame,
         exclude_item_ids=new_item_ids
     )
+
+    if original_timecode:
+        timeline.SetCurrentTimecode(original_timecode)
 
     print(f"字幕已成功加载到时间线: {file_name}")
     return True
@@ -1373,11 +1461,6 @@ win = dispatcher.AddWindow({
                                 ui.Button({"ID": "minimaxDeleteVoice", "Text": "","Weight": 0.1}),
                             ]),
                             ui.HGroup({}, [
-                                ui.Button({"ID": "QuickBrowseButton", "Text": "保存路径", "Weight": 0.34}),
-                                ui.Button({"ID": "QuickMiniMaxConfigButton", "Text": "配置", "Weight": 0.33}),
-                                ui.Button({"ID": "TabVisibilityButton", "Text": "标签页", "Weight": 0.33}),
-                            ]),
-                            ui.HGroup({}, [
                                 ui.Label({"ID": "minimaxSoundEffectLabel","Text": "音效:", "Weight": 0.2}),
                                 ui.ComboBox({"ID": "minimaxSoundEffectCombo", "Text": "", "Weight": 0.8}),
                                 
@@ -1471,9 +1554,12 @@ win = dispatcher.AddWindow({
                     ]),
                     ui.VGroup({"Weight": 0.5, "Spacing": 10,}, [
                         ui.HGroup({"Weight": 0.1}, [
-                            ui.Label({"ID": "PathLabel", "Text": "保存路径", "Alignment": {"AlignLeft": True}, "Weight": 0.2}),
+                            ui.Label({"ID": "PathLabel", "Text": "保存父目录", "Alignment": {"AlignLeft": True}, "Weight": 0.2}),
                             ui.LineEdit({"ID": "Path", "Text": "", "PlaceholderText": "", "ReadOnly": False, "Weight": 0.6}),
                             ui.Button({"ID": "Browse", "Text": "浏览", "Weight": 0.2}),
+                        ]),
+                        ui.HGroup({"Weight": 0.1}, [
+                            ui.CheckBox({"ID": "AutoProjectSubdirCheckBox", "Text": "自动创建工程名子文件夹", "Checked": True, "Alignment": {"AlignLeft": True}, "Weight": 1}),
                         ]),
                         
                         ui.HGroup({"Weight": 0.1}, [
@@ -1489,6 +1575,10 @@ win = dispatcher.AddWindow({
                             ui.Label({"Text": "OpenAI API", "Alignment": {"AlignLeft": True}, "Weight": 0.1}),
                             ui.Button({"ID": "ShowOpenAI", "Text": "配置","Weight": 0.1}),
                             
+                        ]),
+                        ui.HGroup({"Weight": 0.1}, [
+                            ui.Label({"ID": "TabVisibilityEntryLabel", "Text": "标签页显示", "Alignment": {"AlignLeft": True}, "Weight": 0.1}),
+                            ui.Button({"ID": "TabVisibilityButton", "Text": "设置","Weight": 0.1}),
                         ]),
                         ui.Label({"ID":"MoreScriptLabel","Text":"","Weight":0.1,"Alignment": {"AlignHCenter": True, "AlignVCenter": True}}),
                         
@@ -1712,11 +1802,11 @@ tab_visibility_window = dispatcher.AddWindow(
         ui.VGroup(
             [
                 ui.Label({"ID": "TabVisibilityLabel", "Text": "标签页显示设置", "Alignment": {"AlignHCenter": True, "AlignVCenter": True}}),
-                ui.Label({"ID": "TabVisibilityHintLabel", "Text": "修改后重启脚本生效，且至少保留一个标签页可见。", "WordWrap": True}),
+                ui.Label({"ID": "TabVisibilityHintLabel", "Text": "修改后重启脚本生效，配置标签页固定显示。", "WordWrap": True}),
                 ui.CheckBox({"ID": "ShowAzureTabCheckBox", "Text": "显示 Azure 标签页", "Checked": False}),
                 ui.CheckBox({"ID": "ShowMiniMaxTabCheckBox", "Text": "显示 MiniMax 标签页", "Checked": True}),
                 ui.CheckBox({"ID": "ShowOpenAITabCheckBox", "Text": "显示 OpenAI 标签页", "Checked": False}),
-                ui.CheckBox({"ID": "ShowConfigTabCheckBox", "Text": "显示配置标签页", "Checked": False}),
+                ui.CheckBox({"ID": "ShowConfigTabCheckBox", "Text": "显示配置标签页（固定显示）", "Checked": True, "Enabled": False}),
                 ui.HGroup(
                     [
                         ui.Button({"ID": "TabVisibilityConfirm", "Text": "确定", "Weight": 1}),
@@ -1748,9 +1838,8 @@ translations = {
         "OpenAIPreviewButton": "试听",
         "OpenAIInstructionLabel": "指令",
         "minimaxPreviewButton":"试听",
-        "QuickBrowseButton":"保存路径",
-        "QuickMiniMaxConfigButton":"配置",
-        "TabVisibilityButton":"标签页",
+        "TabVisibilityEntryLabel":"标签页显示",
+        "TabVisibilityButton":"设置",
         "LanguageLabel": "语言",
         "NameTypeLabel": "类型",
         "NameLabel": "名称",
@@ -1779,7 +1868,8 @@ translations = {
         "ResetButton": "重置",
         "minimaxResetButton": "重置",
         "OpenAIResetButton": "重置",
-        "PathLabel":"保存路径",
+        "PathLabel":"保存父目录",
+        "AutoProjectSubdirCheckBox":"自动创建工程名子文件夹",
         "Browse":"浏览", 
         "ShowAzure":"配置",
         "ShowMiniMax": "配置",
@@ -1822,11 +1912,11 @@ translations = {
         "OpenAIConfirm":"确定",
         "OpenAIRegisterButton":"注册",
         "TabVisibilityLabel":"标签页显示设置",
-        "TabVisibilityHintLabel":"修改后重启脚本生效，且至少保留一个标签页可见。",
+        "TabVisibilityHintLabel":"修改后重启脚本生效，配置标签页固定显示。",
         "ShowAzureTabCheckBox":"显示 Azure 标签页",
         "ShowMiniMaxTabCheckBox":"显示 MiniMax 标签页",
         "ShowOpenAITabCheckBox":"显示 OpenAI 标签页",
-        "ShowConfigTabCheckBox":"显示配置标签页",
+        "ShowConfigTabCheckBox":"显示配置标签页（固定显示）",
         "TabVisibilityConfirm":"确定",
         "TabVisibilityCancel":"取消",
 
@@ -1852,9 +1942,8 @@ translations = {
         "OpenAIInstructionLabel": "Instruction",
         "openGuideButton":"Usage Tutorial",
         "minimaxPreviewButton":"Preview",
-        "QuickBrowseButton":"Save Path",
-        "QuickMiniMaxConfigButton":"Config",
-        "TabVisibilityButton":"Tabs",
+        "TabVisibilityEntryLabel":"Tab Visibility",
+        "TabVisibilityButton":"Settings",
         "LanguageLabel": "Language",
         "NameTypeLabel": "Type",
         "NameLabel": "Name",
@@ -1882,7 +1971,8 @@ translations = {
         "ResetButton": "Reset",
         "minimaxResetButton": "Reset",
         "OpenAIResetButton": "Reset",
-        "PathLabel":"Path",
+        "PathLabel":"Save Parent Dir",
+        "AutoProjectSubdirCheckBox":"Auto-create project subfolder",
         "Browse":"Browse", 
         "ShowAzure":"Config",
         "ShowMiniMax": "Config",
@@ -1925,11 +2015,11 @@ translations = {
         "OpenAIConfirm":"OK",
         "OpenAIRegisterButton":"Register",
         "TabVisibilityLabel":"Tab Visibility",
-        "TabVisibilityHintLabel":"Changes take effect after restarting the script, and at least one tab must remain visible.",
+        "TabVisibilityHintLabel":"Changes take effect after restarting the script. The Configuration tab always stays visible.",
         "ShowAzureTabCheckBox":"Show Azure tab",
         "ShowMiniMaxTabCheckBox":"Show MiniMax tab",
         "ShowOpenAITabCheckBox":"Show OpenAI tab",
-        "ShowConfigTabCheckBox":"Show Config tab",
+        "ShowConfigTabCheckBox":"Show Config tab (always visible)",
         "TabVisibilityConfirm":"OK",
         "TabVisibilityCancel":"Cancel",
     }
@@ -1940,6 +2030,7 @@ minimax_items = minimax_config_window.GetItems()
 openai_items = openai_config_window.GetItems()
 minimax_clone_items = minimax_clone_window.GetItems()
 tab_visibility_items = tab_visibility_window.GetItems()
+tab_visibility_items["ShowConfigTabCheckBox"].Enabled = False
 msgbox_items = msgbox.GetItems()
 VISIBLE_TAB_STACK_INDICES = [
     stack_index
@@ -1947,7 +2038,7 @@ VISIBLE_TAB_STACK_INDICES = [
     if saved_tab_visibility.get(setting_key, False)
 ]
 if not VISIBLE_TAB_STACK_INDICES:
-    VISIBLE_TAB_STACK_INDICES = [TAB_STACK_INDEX_MAP["SHOW_MINIMAX_TAB"]]
+    VISIBLE_TAB_STACK_INDICES = [TAB_STACK_INDEX_MAP["SHOW_CONFIG_TAB"]]
 for stack_index in VISIBLE_TAB_STACK_INDICES:
     items["MyTabs"].AddTab(translations["cn"]["Tabs"][stack_index])
 items["MyStack"].CurrentIndex = VISIBLE_TAB_STACK_INDICES[0]
@@ -2410,7 +2501,8 @@ if saved_settings:
     minimax_items["minimaxApiKey"].Text = saved_settings.get("minimax_API_KEY", DEFAULT_SETTINGS["minimax_API_KEY"])
     minimax_items["minimaxGroupID"].Text = saved_settings.get("minimax_GROUP_ID", DEFAULT_SETTINGS["minimax_GROUP_ID"])
     minimax_items["intlCheckBox"].Checked = saved_settings.get("minimax_intlCheckBox", DEFAULT_SETTINGS["minimax_intlCheckBox"])
-    items["Path"].Text = saved_settings.get("Path", DEFAULT_SETTINGS["Path"])
+    items["Path"].Text = saved_settings.get("BASE_PATH", DEFAULT_SETTINGS["BASE_PATH"])
+    items["AutoProjectSubdirCheckBox"].Checked = saved_settings.get("AUTO_CREATE_PROJECT_SUBDIR", DEFAULT_SETTINGS["AUTO_CREATE_PROJECT_SUBDIR"])
     items["minimaxModelCombo"].CurrentIndex = saved_settings.get("minimax_Model", DEFAULT_SETTINGS["minimax_Model"])
     items["minimaxLanguageCombo"].CurrentIndex= saved_settings.get("minimax_Language", DEFAULT_SETTINGS["minimax_Language"])
     items["minimaxVoiceCombo"].CurrentIndex= saved_settings.get("minimax_Voice", DEFAULT_SETTINGS["minimax_Voice"])
@@ -2789,6 +2881,54 @@ def timecode_to_frames(timecode, frame_rate):
         return None
 
 
+def frames_to_resolve_timecode(frame_count, frame_rate, drop_frame=False):
+    """
+    将绝对帧数转换为 Resolve 可识别的时间码字符串。
+    """
+    frame_count = int(round(frame_count))
+
+    if drop_frame:
+        if frame_rate not in [23.976, 29.97, 59.94, 119.88]:
+            raise ValueError(f"Unsupported drop frame rate: {frame_rate}")
+
+        nominal_frame_rate = round(frame_rate * 1000 / 1001)
+        drop_frames = int(round(nominal_frame_rate / 15))
+        frames_per_hour = nominal_frame_rate * 60 * 60
+        frames_per_24_hours = frames_per_hour * 24
+        frames_per_10_minutes = nominal_frame_rate * 60 * 10 - drop_frames * 9
+        frames_per_minute = nominal_frame_rate * 60 - drop_frames
+
+        frame_count = frame_count % frames_per_24_hours
+        hours = frame_count // frames_per_hour
+        frame_count = frame_count % frames_per_hour
+
+        ten_minute_blocks = frame_count // frames_per_10_minutes
+        minutes = ten_minute_blocks * 10
+        frame_count = frame_count % frames_per_10_minutes
+
+        while frame_count >= frames_per_minute and (minutes % 10) != 9:
+            frame_count -= frames_per_minute
+            minutes += 1
+
+        if minutes % 10 == 9:
+            extra_minutes = frame_count // (nominal_frame_rate * 60)
+            minutes += extra_minutes
+            frame_count = frame_count % (nominal_frame_rate * 60)
+
+        seconds = frame_count // nominal_frame_rate
+        frames = frame_count % nominal_frame_rate
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d};{frames:02d}"
+
+    nominal_frame_rate = round(frame_rate * 1000 / 1001) if frame_rate in [23.976, 29.97, 47.952, 59.94, 95.904, 119.88] else round(frame_rate)
+    hours = frame_count // (nominal_frame_rate * 3600)
+    frame_count = frame_count % (nominal_frame_rate * 3600)
+    minutes = frame_count // (nominal_frame_rate * 60)
+    frame_count = frame_count % (nominal_frame_rate * 60)
+    seconds = frame_count // nominal_frame_rate
+    frames = frame_count % nominal_frame_rate
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frames:02d}"
+
+
 def print_srt(subtitles, framerate):
     for index, subtitle in enumerate(subtitles):
         start_time = frame_to_timecode(subtitle['start'], framerate)
@@ -2959,7 +3099,7 @@ def get_current_subtitle(current_timeline):
 
 def generate_filename(base_path, subtitle, extension):
     if not os.path.exists(base_path):
-        os.makedirs(base_path)
+        os.makedirs(base_path, exist_ok=True)
     
     # 先把换行去掉
     clean_subtitle = subtitle.replace('\n', ' ').replace('\r', ' ')
@@ -2971,7 +3111,7 @@ def generate_filename(base_path, subtitle, extension):
     count = 0
     while True:
         count += 1
-        filename = f"{base_path}/{clean_subtitle}#{count}{extension}"
+        filename = os.path.join(base_path, f"{clean_subtitle}#{count}{extension}")
         if not os.path.exists(filename):
             return filename
 
@@ -2980,8 +3120,9 @@ def on_fromsub_button_clicked(ev):
     if not current_timeline:
         show_warning_message(STATUS_MESSAGES.create_timeline)
         return
-    if items["Path"].Text == '':
-        show_warning_message(STATUS_MESSAGES.select_save_path)
+
+    save_path = get_effective_save_path(create_dir=True)
+    if not save_path:
         return
 
     try:
@@ -2999,7 +3140,7 @@ def on_fromsub_button_clicked(ev):
     print_text_on_box(subtitle)
     
     extension = ".mp3" if azure_items["UnuseAPICheckBox"].Checked else items["OutputFormatCombo"].CurrentText.split(", ")[1]
-    filename = generate_filename(items["Path"].Text, subtitle, extension)
+    filename = generate_filename(save_path, subtitle, extension)
     
     voice_name = return_voice_name(items["NameCombo"].CurrentText)
     rate = items["RateSpinBox"].Value
@@ -3025,8 +3166,9 @@ def on_fromtxt_button_clicked(ev):
     if not current_timeline:
         show_warning_message(STATUS_MESSAGES.create_timeline)
         return
-    if items["Path"].Text == '':
-        show_warning_message(STATUS_MESSAGES.select_save_path)
+
+    save_path = get_effective_save_path(create_dir=True)
+    if not save_path:
         return
 
     try:
@@ -3043,7 +3185,7 @@ def on_fromtxt_button_clicked(ev):
     subtitle = items["AzureTxt"].PlainText
     
     extension = ".mp3" if azure_items["UnuseAPICheckBox"].Checked else items["OutputFormatCombo"].CurrentText.split(", ")[1]
-    filename = generate_filename(items["Path"].Text, subtitle, extension)
+    filename = generate_filename(save_path, subtitle, extension)
     
     voice_name = return_voice_name(items["NameCombo"].CurrentText)
     rate = items["RateSpinBox"].Value
@@ -3079,8 +3221,8 @@ def on_fromtxt_button_clicked(ev):
 win.On.FromTxtButton.Clicked = on_fromtxt_button_clicked
 
 def on_play_button_clicked(ev):
-    if items["Path"].Text == '':
-        show_warning_message(STATUS_MESSAGES.select_save_path)
+    save_path = get_effective_save_path(create_dir=False)
+    if not save_path:
         return
     if items["AzureTxt"].PlainText == '':
         show_warning_message(STATUS_MESSAGES.prev_txt)
@@ -3324,8 +3466,8 @@ def on_minimax_clone_confirm(ev):
         show_warning_message(STATUS_MESSAGES.enter_api_key)
         return
 
-    if not items["Path"].Text:
-        show_warning_message(STATUS_MESSAGES.select_save_path)
+    save_path = get_effective_save_path(create_dir=True)
+    if not save_path:
         return
 
     
@@ -3411,7 +3553,7 @@ def on_minimax_clone_confirm(ev):
         show_warning_message(STATUS_MESSAGES.download_preclone)
         demo_content = provider.download_media(clone_result["demo_url"])
         if demo_content:
-            demo_path = os.path.join(items["Path"].Text, f"preview_{voice_id}.mp3")
+            demo_path = os.path.join(save_path, f"preview_{voice_id}.mp3")
             with open(demo_path, 'wb') as f:
                 f.write(demo_content)
             add_to_media_pool_and_timeline(current_timeline.GetStartFrame(), current_timeline.GetEndFrame(), demo_path)
@@ -3466,12 +3608,11 @@ win.On.minimaxPreviewButton.Clicked = on_minimax_preview_button_click
 
 def process_minimax_request(text_func, timeline_func):
     # 1. Validate inputs
-    save_path = items["Path"].Text
+    save_path = get_effective_save_path(create_dir=True)
     api_key = minimax_items["minimaxApiKey"].Text
     group_id = minimax_items["minimaxGroupID"].Text
 
     if not save_path:
-        show_warning_message(STATUS_MESSAGES.select_save_path)
         return
 
     if not api_key or not group_id:
@@ -3573,9 +3714,6 @@ def on_minimax_fromsub_button_clicked(ev):
     if not current_timeline:
         show_warning_message(STATUS_MESSAGES.create_timeline)
         return
-    if items["Path"].Text == '':
-        show_warning_message(STATUS_MESSAGES.select_save_path)
-        return
     items["minimaxSubtitleCheckBox"].Checked = False
     process_minimax_request(
         text_func=lambda: get_current_subtitle(current_timeline)[0],
@@ -3587,9 +3725,6 @@ def on_minimax_fromtxt_button_clicked(ev):
     resolve, current_project,current_timeline = connect_resolve()
     if not current_timeline:
         show_warning_message(STATUS_MESSAGES.create_timeline)
-        return
-    if items["Path"].Text == '':
-        show_warning_message(STATUS_MESSAGES.select_save_path)
         return
     process_minimax_request(
         text_func=lambda: items["minimaxText"].PlainText,
@@ -3644,7 +3779,7 @@ minimax_config_window.On.MiniMaxConfigWin.Close = on_minimax_close
 #============== OPENAI ====================#
 def process_openai_request(text_func, timeline_func):
     # 1. Input validation
-    save_path = items["Path"].Text
+    save_path = get_effective_save_path(create_dir=True)
     api_key = openai_items["OpenAIApiKey"].Text
     if not save_path or not api_key:
         show_warning_message(STATUS_MESSAGES.select_save_path if not save_path else STATUS_MESSAGES.enter_api_key)
@@ -3745,26 +3880,24 @@ def on_browse_button_clicked(ev):
     current_path = items["Path"].Text
     selected_path = fusion.RequestDir(current_path)
     if selected_path:
-        # 创建以项目名称命名的子目录
-        project_subdir = os.path.join(selected_path, f"{current_project.GetName()}_TTS")
-        try:
-            os.makedirs(project_subdir, exist_ok=True)
-            items["Path"].Text = str(project_subdir)
-            print(f"Directory created: {project_subdir}")
-        except Exception as e:
-            print(f"Failed to create directory: {e}")
+        items["Path"].Text = str(selected_path)
+        print(f"Base directory selected: {selected_path}")
+        effective_path = get_effective_save_path(create_dir=False, show_warning=False)
+        if effective_path:
+            print(f"Current effective save directory: {effective_path}")
     else:
         print("No directory selected or the request failed.")
 win.On.Browse.Clicked = on_browse_button_clicked
-win.On.QuickBrowseButton.Clicked = on_browse_button_clicked
 
 def on_show_tab_visibility(ev):
+    tab_visibility_items["ShowConfigTabCheckBox"].Checked = True
     tab_visibility_window.Show()
 
 def on_tab_visibility_close(ev):
     tab_visibility_window.Hide()
 
 def on_tab_visibility_confirm(ev):
+    tab_visibility_items["ShowConfigTabCheckBox"].Checked = True
     selected_count = sum([
         tab_visibility_items["ShowAzureTabCheckBox"].Checked,
         tab_visibility_items["ShowMiniMaxTabCheckBox"].Checked,
@@ -3818,7 +3951,8 @@ def close_and_save(settings_file):
         "minimax_API_KEY": minimax_items["minimaxApiKey"].Text,
         "minimax_GROUP_ID": minimax_items["minimaxGroupID"].Text,
         "minimax_intlCheckBox":minimax_items["intlCheckBox"].Checked,
-        "Path": items["Path"].Text,
+        "BASE_PATH": items["Path"].Text.strip(),
+        "AUTO_CREATE_PROJECT_SUBDIR": items["AutoProjectSubdirCheckBox"].Checked,
         "minimax_Model": items["minimaxModelCombo"].CurrentIndex,
         #"Text": items["minimaxText"].PlainText,
         "minimax_Voice": items["minimaxVoiceCombo"].CurrentIndex,
@@ -3879,7 +4013,6 @@ win.On.ShowAzure.Clicked = on_show_azure
 def on_show_minimax(ev):
     minimax_config_window.Show()
 win.On.ShowMiniMax.Clicked = on_show_minimax
-win.On.QuickMiniMaxConfigButton.Clicked = on_show_minimax
 
 def on_show_minimax_clone(ev):
     minimax_clone_items["minimaxNeedNoiseReduction"].Enabled = not minimax_clone_items["minimaxOnlyAddID"].Checked
