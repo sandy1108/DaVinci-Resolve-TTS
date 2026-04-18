@@ -140,6 +140,7 @@ DEFAULT_SETTINGS = {
     "minimax_Language": 0,
     "minimax_SubtitleCheckBox":False,
     "minimax_Emotion": 0,
+    "minimax_SoundEffect": 0,
     "minimax_Rate": 1.0,
     "minimax_Volume": 1.0,
     "minimax_Pitch": 0,
@@ -342,7 +343,7 @@ class MiniMaxProvider:
     """
     Handles all interactions with the MiniMax TTS and Voice Clone APIs.
     """
-    BASE_URL = "https://api.minimax.chat"
+    BASE_URL = "https://api.minimaxi.com"
     BASE_URL_INTL = "https://api.minimaxi.chat"
 
     def __init__(self, api_key: str, group_id: str, is_intl: bool = False):
@@ -366,7 +367,10 @@ class MiniMaxProvider:
         base_resp = response_data.get("base_resp", {})
         status_code = base_resp.get("status_code")
         status_msg = base_resp.get("status_msg", "Unknown error")
+        trace_id = response_data.get("trace_id", "")
         error_message = f"API Error {status_code}: {status_msg}"
+        if trace_id:
+            error_message = f"{error_message} (trace_id={trace_id})"
         print(error_message)
         return {"error_code": status_code, "error_message": error_message}
 
@@ -387,6 +391,7 @@ class MiniMaxProvider:
         if sound_effects and sound_effects not in ["默认", "Default"]:
             payload["voice_modify"]["sound_effects"] = sound_effects
         print(f"Sending payload to MiniMax: {payload}")
+        print(f"MiniMax request URL: {url}")
 
         try:
             response = self.session.post(url, json=payload, timeout=(5, 60))
@@ -414,6 +419,7 @@ class MiniMaxProvider:
         show_warning_message(STATUS_MESSAGES.file_upload)
         url = self._make_url("/v1/files/upload")
         self.session.headers.pop("Content-Type", None)
+        print(f"MiniMax upload URL: {url}")
 
         try:
             with open(file_path, 'rb') as f:
@@ -438,6 +444,7 @@ class MiniMaxProvider:
         """Submits a voice clone job."""
         url = self._make_url("/v1/voice_clone")
         self.session.headers["Content-Type"] = "application/json"
+        print(f"MiniMax clone URL: {url}")
 
         payload = {"file_id": file_id, "voice_id": voice_id, "need_noise_reduction": need_nr, "need_volume_normalization": need_vn}
         if text:
@@ -716,6 +723,29 @@ def save_settings(settings, prefs_path):
     prefs = load_prefs(prefs_path)
     prefs["settings"] = settings if isinstance(settings, dict) else {}
     save_prefs(prefs, prefs_path)
+
+def get_saved_setting(setting_key, default_value=None):
+    if default_value is None:
+        default_value = DEFAULT_SETTINGS.get(setting_key, "")
+    latest_settings = load_settings(prefs_file)
+    return latest_settings.get(setting_key, default_value)
+
+def get_control_text_or_saved(control, setting_key, default_value=""):
+    current_text = ""
+    if hasattr(control, "Text") and control.Text is not None:
+        current_text = str(control.Text).strip()
+    if current_text:
+        return current_text
+
+    saved_value = get_saved_setting(setting_key, default_value)
+    if isinstance(saved_value, str):
+        saved_value = saved_value.strip()
+    if saved_value and hasattr(control, "Text"):
+        control.Text = str(saved_value)
+    return saved_value
+
+def persist_current_preferences():
+    close_and_save(prefs_file)
 
 def normalize_tab_visibility(settings):
     normalized = {
@@ -1126,6 +1156,34 @@ def get_new_subtitle_items(timeline, before_snapshot):
     return new_items
 
 
+def collect_stable_new_subtitle_items(timeline, before_snapshot, attempts=8, delay_seconds=0.15):
+    """
+    在字幕导入后短暂轮询，尽量等待 Resolve 内部落点稳定，再返回新增字幕集合。
+    """
+    latest_items = []
+    last_signature = None
+    stable_hits = 0
+
+    for _ in range(max(1, attempts)):
+        current_items = get_new_subtitle_items(timeline, before_snapshot)
+        if current_items:
+            current_start, current_end = get_subtitle_items_range(current_items)
+            current_signature = (len(current_items), current_start, current_end)
+            latest_items = current_items
+
+            if current_signature == last_signature:
+                stable_hits += 1
+                if stable_hits >= 1:
+                    break
+            else:
+                stable_hits = 0
+                last_signature = current_signature
+
+        time.sleep(delay_seconds)
+
+    return latest_items
+
+
 def get_subtitle_items_range(items):
     """
     计算字幕片段列表的整体时间范围。
@@ -1226,9 +1284,12 @@ def import_srt_to_timeline(srt_path, insert_position_frame=0):
     if timeline is None:
         print("错误：未找到当前时间线")
         return False
+
+    ensure_subtitle_track_exists(timeline)
     
     frame_rate = float(timeline.GetSetting("timelineFrameRate"))
     insert_position_frame = int(insert_position_frame or 0)
+    timeline_start_frame = int(timeline.GetStartFrame() or 0)
 
     # 2. 解析原始 SRT 时间范围
     relative_start_frame, relative_end_frame = parse_srt_time_range(srt_path, frame_rate)
@@ -1288,6 +1349,11 @@ def import_srt_to_timeline(srt_path, insert_position_frame=0):
             return None
 
         before_snapshot = get_subtitle_items_snapshot(timeline)
+        had_existing_subtitles = bool(before_snapshot)
+        if had_existing_subtitles:
+            print(f"导入前已有字幕片段：{len(before_snapshot)} 条")
+        else:
+            print("导入前字幕轨为空，等待 Resolve 稳定首批字幕落点。")
         new_clip = imported[0]
         timeline.SetCurrentTimecode(target_timecode)
         appended_items = media_pool.AppendToTimeline([new_clip])
@@ -1295,15 +1361,15 @@ def import_srt_to_timeline(srt_path, insert_position_frame=0):
             print("错误：将字幕添加到时间线失败")
             return None
 
-        new_items = get_new_subtitle_items(timeline, before_snapshot)
+        new_items = collect_stable_new_subtitle_items(timeline, before_snapshot)
         if not new_items:
             print("未能通过时间线差分识别新字幕，回退到 AppendToTimeline 返回值。")
             new_items = appended_items
 
-        return new_items
+        return new_items, had_existing_subtitles
 
     # 4. 首次导入字幕，并通过时间线差分识别完整的新字幕集合
-    new_items = import_and_collect_new_items(srt_path)
+    new_items, had_existing_subtitles = import_and_collect_new_items(srt_path)
     if not new_items:
         if original_timecode:
             timeline.SetCurrentTimecode(original_timecode)
@@ -1322,7 +1388,22 @@ def import_srt_to_timeline(srt_path, insert_position_frame=0):
             print(f"检测到字幕起点偏移：{position_delta} 帧，准备重新校正导入。")
             timeline.DeleteClips(new_items)
 
-            if position_delta < 0:
+            anchored_to_timeline_start = (
+                not had_existing_subtitles and
+                actual_start_frame == timeline_start_frame + relative_start_frame
+            )
+
+            if anchored_to_timeline_start:
+                print("检测到空字幕轨首插被锚定到时间线起点，改为按时间线起点预偏移 SRT 后重导入。")
+                adjusted_srt_path = srt_path.replace('.srt', '_positioned.srt')
+                adjust_srt_timestamps(
+                    srt_path=srt_path,
+                    offset_frames=insert_position_frame - timeline_start_frame,
+                    frame_rate=frame_rate,
+                    output_path=adjusted_srt_path
+                )
+                final_import_path = adjusted_srt_path
+            elif position_delta < 0:
                 print("检测到负向偏移，继续通过回到目标播放头位置重新导入，避免生成负时间戳导致字幕头部丢失。")
                 final_import_path = srt_path
             else:
@@ -1335,7 +1416,7 @@ def import_srt_to_timeline(srt_path, insert_position_frame=0):
                 )
                 final_import_path = adjusted_srt_path
 
-            new_items = import_and_collect_new_items(final_import_path)
+            new_items, had_existing_subtitles = import_and_collect_new_items(final_import_path)
             if not new_items:
                 if original_timecode:
                     timeline.SetCurrentTimecode(original_timecode)
@@ -1344,6 +1425,32 @@ def import_srt_to_timeline(srt_path, insert_position_frame=0):
             actual_start_frame, actual_end_frame = get_subtitle_items_range(new_items)
             if actual_start_frame is not None and actual_end_frame is not None:
                 print(f"校正后字幕范围：{actual_start_frame} - {actual_end_frame} 帧，共 {len(new_items)} 条")
+
+                anchored_after_retry = (
+                    not had_existing_subtitles and
+                    final_import_path == srt_path and
+                    actual_start_frame == timeline_start_frame + relative_start_frame
+                )
+                if anchored_after_retry:
+                    print("二次导入后仍确认空字幕轨被锚定到时间线起点，改为生成预偏移字幕再次导入。")
+                    timeline.DeleteClips(new_items)
+                    adjusted_srt_path = srt_path.replace('.srt', '_positioned.srt')
+                    adjust_srt_timestamps(
+                        srt_path=srt_path,
+                        offset_frames=insert_position_frame - timeline_start_frame,
+                        frame_rate=frame_rate,
+                        output_path=adjusted_srt_path
+                    )
+                    final_import_path = adjusted_srt_path
+                    new_items, had_existing_subtitles = import_and_collect_new_items(final_import_path)
+                    if not new_items:
+                        if original_timecode:
+                            timeline.SetCurrentTimecode(original_timecode)
+                        return False
+
+                    actual_start_frame, actual_end_frame = get_subtitle_items_range(new_items)
+                    if actual_start_frame is not None and actual_end_frame is not None:
+                        print(f"三次导入后字幕范围：{actual_start_frame} - {actual_end_frame} 帧，共 {len(new_items)} 条")
 
     if actual_start_frame is None or actual_end_frame is None:
         print("无法确认最终字幕范围，跳过旧字幕清理以避免误删。")
@@ -2563,10 +2670,12 @@ if saved_settings:
     items["minimaxVoiceCombo"].CurrentIndex= saved_settings.get("minimax_Voice", DEFAULT_SETTINGS["minimax_Voice"])
     items["minimaxSubtitleCheckBox"].Checked = saved_settings.get("minimax_SubtitleCheckBox", DEFAULT_SETTINGS["minimax_SubtitleCheckBox"])
     items["minimaxEmotionCombo"].CurrentIndex = saved_settings.get("minimax_Emotion", DEFAULT_SETTINGS["minimax_Emotion"])
+    items["minimaxSoundEffectCombo"].CurrentIndex = saved_settings.get("minimax_SoundEffect", DEFAULT_SETTINGS["minimax_SoundEffect"])
     items["minimaxRateSpinBox"].Value = saved_settings.get("minimax_Rate", DEFAULT_SETTINGS["minimax_Rate"])
     items["minimaxVolumeSpinBox"].Value = saved_settings.get("minimax_Volume", DEFAULT_SETTINGS["minimax_Volume"])
     items["minimaxPitchSpinBox"].Value = saved_settings.get("minimax_Pitch", DEFAULT_SETTINGS["minimax_Pitch"])
     items["minimaxFormatCombo"].CurrentIndex = saved_settings.get("minimax_Format", DEFAULT_SETTINGS["minimax_Format"])
+    items["minimaxBreakSpinBox"].Value = saved_settings.get("minimax_Break", DEFAULT_SETTINGS["minimax_Break"])
     
     openai_items["OpenAIApiKey"].Text = saved_settings.get("OpenAI_API_KEY", DEFAULT_SETTINGS["OpenAI_API_KEY"])
     openai_items["OpenAIBaseURL"].Text = saved_settings.get("OpenAI_BASE_URL", DEFAULT_SETTINGS["OpenAI_BASE_URL"])    
@@ -3182,8 +3291,8 @@ def on_fromsub_button_clicked(ev):
 
     try:
         provider = AzureTTSProvider(
-            api_key=azure_items["ApiKey"].Text,
-            region=azure_items["Region"].Text,
+            api_key=get_control_text_or_saved(azure_items["ApiKey"], "API_KEY"),
+            region=get_control_text_or_saved(azure_items["Region"], "REGION"),
             use_api=not azure_items["UnuseAPICheckBox"].Checked
         )
     except ValueError as e:
@@ -3228,8 +3337,8 @@ def on_fromtxt_button_clicked(ev):
 
     try:
         provider = AzureTTSProvider(
-            api_key=azure_items["ApiKey"].Text,
-            region=azure_items["Region"].Text,
+            api_key=get_control_text_or_saved(azure_items["ApiKey"], "API_KEY"),
+            region=get_control_text_or_saved(azure_items["Region"], "REGION"),
             use_api=not azure_items["UnuseAPICheckBox"].Checked
         )
     except ValueError as e:
@@ -3285,8 +3394,8 @@ def on_play_button_clicked(ev):
     
     try:
         provider = AzureTTSProvider(
-            api_key=azure_items["ApiKey"].Text,
-            region=azure_items["Region"].Text,
+            api_key=get_control_text_or_saved(azure_items["ApiKey"], "API_KEY"),
+            region=get_control_text_or_saved(azure_items["Region"], "REGION"),
             use_api=not azure_items["UnuseAPICheckBox"].Checked
         )
     except ValueError as e:
@@ -3512,7 +3621,9 @@ win.On.minimaxDeleteVoice.Clicked = on_delete_minimax_clone_voice
 
 def on_minimax_clone_confirm(ev):
     # 1. Parameter validation
-    if not minimax_items["minimaxGroupID"].Text or not minimax_items["minimaxApiKey"].Text:
+    minimax_group_id = get_control_text_or_saved(minimax_items["minimaxGroupID"], "minimax_GROUP_ID")
+    minimax_api_key = get_control_text_or_saved(minimax_items["minimaxApiKey"], "minimax_API_KEY")
+    if not minimax_group_id or not minimax_api_key:
         show_warning_message(STATUS_MESSAGES.enter_api_key)
         return
 
@@ -3531,8 +3642,8 @@ def on_minimax_clone_confirm(ev):
     # 2. Initialize Provider
     try:
         provider = MiniMaxProvider(
-            api_key=minimax_items["minimaxApiKey"].Text,
-            group_id=minimax_items["minimaxGroupID"].Text,
+            api_key=minimax_api_key,
+            group_id=minimax_group_id,
             is_intl=minimax_items["intlCheckBox"].Checked
         )
     except ValueError as e:
@@ -3659,8 +3770,8 @@ win.On.minimaxPreviewButton.Clicked = on_minimax_preview_button_click
 def process_minimax_request(text_func, timeline_func):
     # 1. Validate inputs
     save_path = get_effective_save_path(create_dir=True)
-    api_key = minimax_items["minimaxApiKey"].Text
-    group_id = minimax_items["minimaxGroupID"].Text
+    api_key = get_control_text_or_saved(minimax_items["minimaxApiKey"], "minimax_API_KEY")
+    group_id = get_control_text_or_saved(minimax_items["minimaxGroupID"], "minimax_GROUP_ID")
 
     if not save_path:
         return
@@ -3803,6 +3914,7 @@ def on_minimax_reset_button_clicked(ev):
     items["minimaxVoiceCombo"].CurrentIndex = DEFAULT_SETTINGS["minimax_Voice"]
     items["minimaxLanguageCombo"].CurrentIndex = DEFAULT_SETTINGS["minimax_Language"]
     items["minimaxEmotionCombo"].CurrentIndex = DEFAULT_SETTINGS["minimax_Emotion"]
+    items["minimaxSoundEffectCombo"].CurrentIndex = DEFAULT_SETTINGS["minimax_SoundEffect"]
     items["minimaxRateSpinBox"].Value = DEFAULT_SETTINGS["minimax_Rate"]
     items["minimaxVolumeSpinBox"].Value = DEFAULT_SETTINGS["minimax_Volume"]
     items["minimaxPitchSpinBox"].Value = DEFAULT_SETTINGS["minimax_Pitch"]
@@ -3821,6 +3933,7 @@ def on_minimax_register_link_button_clicked(ev):
 minimax_config_window.On.minimaxRegisterButton.Clicked = on_minimax_register_link_button_clicked
 
 def on_minimax_close(ev):
+    persist_current_preferences()
     print("MiniMax API 配置完成")
     minimax_config_window.Hide()
 minimax_config_window.On.MiniMaxConfirm.Clicked = on_minimax_close
@@ -3830,7 +3943,8 @@ minimax_config_window.On.MiniMaxConfigWin.Close = on_minimax_close
 def process_openai_request(text_func, timeline_func):
     # 1. Input validation
     save_path = get_effective_save_path(create_dir=True)
-    api_key = openai_items["OpenAIApiKey"].Text
+    api_key = get_control_text_or_saved(openai_items["OpenAIApiKey"], "OpenAI_API_KEY")
+    base_url = get_control_text_or_saved(openai_items["OpenAIBaseURL"], "OpenAI_BASE_URL")
     if not save_path or not api_key:
         show_warning_message(STATUS_MESSAGES.select_save_path if not save_path else STATUS_MESSAGES.enter_api_key)
         return
@@ -3839,7 +3953,7 @@ def process_openai_request(text_func, timeline_func):
 
     # 2. Initialize Provider
     try:
-        provider = OpenAIProvider(api_key, openai_items["OpenAIBaseURL"].Text)
+        provider = OpenAIProvider(api_key, base_url)
     except ValueError as e:
         print(e)
         show_warning_message(STATUS_MESSAGES.synthesis_failed)
@@ -3921,6 +4035,7 @@ def on_openai_preview_button_clicked(ev):
 win.On.OpenAIPreviewButton.Clicked = on_openai_preview_button_clicked
 
 def on_openai_close(ev):
+    persist_current_preferences()
     print("OpenAI API 配置完成")
     openai_config_window.Hide()
 openai_config_window.On.OpenAIConfirm.Clicked = on_openai_close
@@ -3931,6 +4046,7 @@ def on_browse_button_clicked(ev):
     selected_path = fusion.RequestDir(current_path)
     if selected_path:
         items["Path"].Text = str(selected_path)
+        persist_current_preferences()
         print(f"Base directory selected: {selected_path}")
         effective_path = get_effective_save_path(create_dir=False, show_warning=False)
         if effective_path:
@@ -4009,6 +4125,7 @@ def close_and_save(prefs_path):
         "minimax_Language": items["minimaxLanguageCombo"].CurrentIndex,
         "minimax_SubtitleCheckBox":items["minimaxSubtitleCheckBox"].Checked,
         "minimax_Emotion": items["minimaxEmotionCombo"].CurrentIndex,
+        "minimax_SoundEffect": items["minimaxSoundEffectCombo"].CurrentIndex,
         "minimax_Rate": items["minimaxRateSpinBox"].Value,
         "minimax_Volume": items["minimaxVolumeSpinBox"].Value,
         "minimax_Pitch": items["minimaxPitchSpinBox"].Value,
@@ -4079,6 +4196,7 @@ win.On.ShowOpenAI.Clicked = on_show_openai
 
 # Azure配置窗口按钮事件
 def on_azure_close(ev):
+    persist_current_preferences()
     print("Azure API 配置完成")
     azure_config_window.Hide()
 azure_config_window.On.AzureConfirm.Clicked = on_azure_close
