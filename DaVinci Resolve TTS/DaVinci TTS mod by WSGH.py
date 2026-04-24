@@ -381,7 +381,7 @@ class MiniMaxProvider:
 
         payload = {
             "model": model, "text": text, "stream": False, "subtitle_enable": subtitle_enable,
-            "voice_setting": {"voice_id": voice_id, "speed": speed, "vol": vol, "pitch": pitch},
+            "voice_setting": {"text_normalization": True, "voice_id": voice_id, "speed": speed, "vol": vol, "pitch": pitch},
             "audio_setting": {"sample_rate": 32000, "bitrate": 128000, "format": file_format, "channel": 2},
             "voice_modify": {},  
         }
